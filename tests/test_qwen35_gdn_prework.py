@@ -1249,3 +1249,214 @@ def test_qwen4_decode_plan_turns_ineligible_on_replacement(monkeypatch):
         mx.zeros((1, HV, DV, DK)),
     )
     assert fallbacks == [(1, 1, 2560)]
+
+
+# --- Fused Qwen4 speculative verify ------------------------------------------
+
+P = C + HV * DV + 2 * HV  # stacked in-projection row [qkv | z | b | a]
+
+
+@pytest.fixture
+def qwen4_verify(monkeypatch):
+    """Patched decode and verify entries, the row-exact projection routing, and
+    a count of fused verify launches."""
+    from omlx.patches import qwen35_verify_qmm
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    qwen35_verify_qmm.apply_verify_qmm_patch()
+    launches = []
+    step = prework_mod.qwen4_verify_step_fused
+
+    def counted(*args):
+        launches.append(args[0].shape[1])
+        return step(*args)
+
+    monkeypatch.setattr(prework_mod, "qwen4_verify_step_fused", counted)
+    yield launches
+    qwen35_verify_qmm.set_verify_qmm_armed(False)
+
+
+def _verify_block(module, inputs, conv_state, recurrent_state, *, row_exact=True):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen4_exp.language import _VERIFIER
+
+    from omlx.patches import qwen35_verify_qmm
+
+    cache = ArraysCache(size=2)
+    cache[0], cache[1] = conv_state, recurrent_state
+    transaction = start_speculative_cache([cache], inputs.shape[1])
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=row_exact)
+    try:
+        out = _VERIFIER._gated_delta(module, inputs, None, cache)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    mx.eval(out, cache.state)
+    return out, cache, transaction
+
+
+def _same(want, got):
+    return (
+        want.dtype == got.dtype
+        and want.shape == got.shape
+        and mx.array_equal(_bits(want), _bits(got)).item()
+    )
+
+
+def _verify_inputs(rows, seed):
+    mx.random.seed(seed)
+    return (
+        (mx.random.normal((1, rows, 2560)) * 0.5).astype(mx.bfloat16),
+        (mx.random.normal((1, 3, C)) * 0.5).astype(mx.bfloat16),
+        mx.random.normal((1, HV, DV, DK)) * 0.05,
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 9])
+@pytest.mark.parametrize("seed", [3, 11])
+def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
+    monkeypatch, qwen4_verify, signatures, rows, seed
+):
+    """Outputs, next states, rollback records and every accepted prefix."""
+    import copy
+
+    from mlx.utils import tree_flatten
+
+    module = _real_qwen4_decode_module(signatures, seed)
+    inputs, conv_state, recurrent_state = _verify_inputs(rows, seed + rows)
+    monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_FUSED", False)
+    want, want_cache, want_tx = _verify_block(module, inputs, conv_state, recurrent_state)
+    assert qwen4_verify == []
+    monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_FUSED", True)
+    got, got_cache, got_tx = _verify_block(module, inputs, conv_state, recurrent_state)
+    assert qwen4_verify == [rows]
+
+    assert _same(want, got)
+    for index in (0, 1):
+        assert _same(want_cache[index], got_cache[index])
+    want_records = want_cache._speculation["records"]
+    got_records = got_cache._speculation["records"]
+    (kind, want_window, width), got_window = want_records[0], got_records[0]
+    assert got_window[0] == kind == "window" and got_window[2] == width == 3
+    assert _same(want_window, got_window[1])
+    (kind, want_history, want_final), got_states = want_records[1], got_records[1]
+    assert got_states[0] == kind == "states"
+    if rows == 1:
+        assert want_history is None and got_states[1] is None
+    else:
+        assert _same(want_history, got_states[1])
+    assert _same(want_final, got_states[2])
+    for keep in range(rows + 1):
+        want_kept, want_keep_tx = copy.deepcopy((want_cache, want_tx))
+        got_kept, got_keep_tx = copy.deepcopy((got_cache, got_tx))
+        want_keep_tx.commit([keep])
+        got_keep_tx.commit([keep])
+        for (_, a), (_, b) in zip(
+            tree_flatten(want_kept.state), tree_flatten(got_kept.state), strict=True
+        ):
+            assert _same(a, b), keep
+    want_tx.abort()
+    got_tx.abort()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [2, 3, 4])
+@pytest.mark.parametrize("seed", [5, 23])
+def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
+    monkeypatch, qwen4_verify, rows, seed
+):
+    """Row t, the state after it and the conv window equal the t-th planned
+    one-token decode step; a partial accept restores that step's states."""
+    import copy
+
+    from mlx_vlm.models.cache import ArraysCache
+
+    decode_steps = []
+    decode_step = prework_mod.qwen4_decode_step_fused
+
+    def counted(*args):
+        decode_steps.append(1)
+        return decode_step(*args)
+
+    monkeypatch.setattr(prework_mod, "qwen4_decode_step_fused", counted)
+    module = _real_qwen4_decode_module(((6, 64),) * 4, seed)
+    inputs, conv_state, recurrent_state = _verify_inputs(rows, seed)
+    serial = ArraysCache(size=2)
+    serial[0], serial[1] = conv_state, recurrent_state
+    outputs, convs, states = [], [conv_state], [recurrent_state]
+    for t in range(rows):
+        outputs.append(module(inputs[:, t : t + 1], cache=serial))
+        mx.eval(outputs[-1], serial[0], serial[1])
+        convs.append(serial[0])
+        states.append(serial[1])
+    assert len(decode_steps) == rows
+
+    got, cache, transaction = _verify_block(module, inputs, conv_state, recurrent_state)
+    assert qwen4_verify == [rows]
+    for t in range(rows):
+        assert _same(outputs[t][:, 0], got[:, t]), t
+    window = cache._speculation["records"][0][1]
+    _, history, final = cache._speculation["records"][1]
+    for t in range(rows + 1):
+        assert _same(convs[t], window[:, t : t + 3]), t
+    for t in range(rows - 1):
+        assert _same(states[t + 1], history[:, t]), t
+    assert _same(states[rows], final)
+    assert _same(convs[rows], cache[0]) and _same(states[rows], cache[1])
+    for keep in range(rows + 1):
+        kept, keep_tx = copy.deepcopy((cache, transaction))
+        keep_tx.commit([keep])
+        assert _same(convs[keep], kept[0]) and _same(states[keep], kept[1]), keep
+    transaction.abort()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("rows", [1, 2, 4, 9])
+@pytest.mark.parametrize("seed", [7, 29])
+def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows, seed):
+    """The FP32 instantiation carries the unrounded conv, q/k/v, recurrence
+    output and gate products that BF16 rounds away."""
+    mx.random.seed(seed)
+    conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
+    q_scale = mx.array(DK**-0.5, dtype=dtype)
+    A_log = (mx.random.normal((HV,)) * 0.5).astype(dtype)
+    dt_bias = (mx.random.normal((HV,)) * 0.5).astype(dtype)
+    norm_w = (1 + mx.random.normal((DV,)) * 0.1).astype(dtype)
+    eps = mx.array(1e-6, dtype=mx.float32)
+    conv_state = (mx.random.normal((1, 3, C)) * 0.5).astype(dtype)
+    state = mx.random.normal((1, HV, DV, DK)) * 0.1
+    proj = (mx.random.normal((1, rows, P)) * 0.8).astype(dtype)
+
+    conv_out, window, history, final, out = prework_mod.qwen4_verify_step_fused(
+        proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, HK, HV, DK, DV
+    )
+    assert (history is None) == (rows == 1)
+    assert _same(mx.concatenate([conv_state, proj[..., :C]], axis=1), window)
+    conv, recurrent = conv_state, state
+    for t in range(rows):
+        qkv, z, b, a = mx.split(proj[:, t : t + 1], [C, C + HV * DV, C + HV * DV + HV], axis=-1)
+        conv, recurrent, gated = prework_mod.qwen4_decode_step_fused(
+            qkv, z, b, a, conv, conv_w, q_scale, A_log, dt_bias, recurrent, norm_w, eps,
+            HK, HV, DK, DV,
+        )
+        assert _same(gated[:, 0], out[:, t]), t
+        if t < rows - 1:
+            assert _same(recurrent, history[:, t]), t
+    assert _same(conv, conv_out) and _same(recurrent, final)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_qwen4_fused_verify_multi_row_blocks_need_row_exact_arming(qwen4_verify):
+    """Unarmed multi-row verify projections run other kernels, so their rows
+    keep the per-op path; a one-row block takes one-row arithmetic either way."""
+    module = _real_qwen4_decode_module(((6, 64),) * 4, 13)
+    for rows in (3, 1):
+        inputs, conv_state, recurrent_state = _verify_inputs(rows, 13)
+        _, _, transaction = _verify_block(
+            module, inputs, conv_state, recurrent_state, row_exact=False
+        )
+        transaction.abort()
+    assert qwen4_verify == [1]

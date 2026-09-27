@@ -524,9 +524,9 @@ class OneRowQmv:
         )[0]
 
 
-def one_row_qmv(weight, scales, biases, bits, group_size, mode, dtype, rps):
-    """A ``OneRowQmv`` where stock one-row ``quantized_matmul`` runs ``qmv_fast``
-    (K a multiple of 512, N of 8) and ``2 * rps`` divides N, else None."""
+def _qmv_fast_layout(weight, scales, biases, bits, group_size, mode, dtype, rps) -> bool:
+    """Stock one-row ``quantized_matmul`` runs ``qmv_fast`` on this layout (K a
+    multiple of 512, N of 8) and ``2 * rps`` divides N."""
     if (
         mode != "affine"
         or bits not in _BITS
@@ -539,18 +539,85 @@ def one_row_qmv(weight, scales, biases, bits, group_size, mode, dtype, rps):
         or biases.dtype != dtype
         or scales.shape != biases.shape
     ):
-        return None
+        return False
     n = int(weight.shape[0])
     k = int(scales.shape[-1]) * group_size
-    if (
+    return not (
         k % 512
         or n % 8
         or n % (2 * rps)
         or scales.shape != (n, k // group_size)
         or weight.shape[1] * 32 != k * bits
-    ):
+    )
+
+
+def one_row_qmv(weight, scales, biases, bits, group_size, mode, dtype, rps):
+    """A ``OneRowQmv`` on a ``_qmv_fast_layout``, else None."""
+    if not _qmv_fast_layout(weight, scales, biases, bits, group_size, mode, dtype, rps):
         return None
     return OneRowQmv(weight, scales, biases, bits, group_size, dtype, rps)
 
 
-__all__ = ["MAX_ROWS", "OneRowQmv", "one_row_qmv", "quantized_linear", "quantized_linears"]
+class RowsQmv:
+    """``OneRowQmv`` for a block of rows: every row of ``x`` gets one-row
+    ``qmv_fast`` bits. ``geometry(rows)`` gives the output columns per
+    simdgroup and the rows each threadgroup applies its decoded weight tile
+    to (a divisor of ``rows``); launch parameters are kept per row count."""
+
+    __slots__ = ("_kernel", "_weights", "_k", "_n", "_dtype", "_geometry", "_launch")
+
+    def __init__(self, weight, scales, biases, bits, group_size, dtype, geometry):
+        self._kernel = _kernel(bits, group_size, True)
+        self._weights = (weight, scales, biases)
+        self._k = int(scales.shape[-1]) * group_size
+        self._n = int(weight.shape[0])
+        self._dtype = dtype
+        self._geometry = geometry
+        self._launch = {}
+
+    def __call__(self, x: mx.array) -> mx.array:
+        """``x`` is ``[..., K]`` of the planned dtype, row-contiguous."""
+        rows = x.size // self._k
+        launch = self._launch.get(rows)
+        if launch is None:
+            rps, per_group = self._geometry(rows)
+            if rows % per_group or self._n % (2 * rps):
+                raise ValueError(f"no {rps}x{per_group} tile for {rows} rows of {self._n}")
+            launch = self._launch[rows] = (
+                [
+                    ("T", self._dtype),
+                    ("K_SIZE", self._k),
+                    ("N_SIZE", self._n),
+                    ("ROWS", per_group),
+                    ("RPS", rps),
+                ],
+                (32, 2 * (rows // per_group), self._n // (2 * rps)),
+            )
+        template, grid = launch
+        return self._kernel(
+            inputs=[x, *self._weights],
+            template=template,
+            grid=grid,
+            threadgroup=(32, 2, 1),
+            output_shapes=[(*x.shape[:-1], self._n)],
+            output_dtypes=[self._dtype],
+        )[0]
+
+
+def rows_qmv(weight, scales, biases, bits, group_size, mode, dtype, geometry):
+    """A ``RowsQmv`` on a ``_qmv_fast_layout`` (checked at one column per
+    simdgroup; ``__call__`` checks the tile ``geometry`` picks), else None."""
+    if not _qmv_fast_layout(weight, scales, biases, bits, group_size, mode, dtype, 1):
+        return None
+    return RowsQmv(weight, scales, biases, bits, group_size, dtype, geometry)
+
+
+__all__ = [
+    "MAX_ROWS",
+    "OneRowQmv",
+    "RowsQmv",
+    "one_row_qmv",
+    "quantized_linear",
+    "quantized_linears",
+    "rows_qmv",
+]

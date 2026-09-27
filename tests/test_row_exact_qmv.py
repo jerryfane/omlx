@@ -143,3 +143,45 @@ def test_one_row_qmv_declines_shapes_stock_does_not_run_fast(k, n, rps):
         row_exact_qmv.one_row_qmv(weight, scales, biases, 8, 64, "affine", mx.bfloat16, rps)
         is None
     )
+
+
+# Every (columns per simdgroup, rows per threadgroup) tile gives each row the
+# one-row bits, so retuning the geometry cannot change a verify row.
+@pytest.mark.parametrize(
+    "k, n, bits, group_size",
+    [
+        (2560, 16480, 6, 64),  # DeltaNet stacked qkv/z/b/a in-projection
+        (6144, 2560, 5, 128),  # DeltaNet out-projection
+        (2560, 1024, 8, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 9])
+def test_rows_qmv_every_geometry_equals_one_row_quantized_matmul(
+    k, n, bits, group_size, dtype, rows
+):
+    weight, scales, biases = _quantized(k, n, bits, group_size, dtype, k + rows)
+    x = mx.random.normal((1, rows, k)).astype(dtype)
+    expected = mx.concatenate(
+        [
+            mx.quantized_matmul(
+                x[:, r : r + 1], weight, scales, biases, transpose=True,
+                group_size=group_size, bits=bits,
+            )
+            for r in range(rows)
+        ],
+        axis=1,
+    )
+    view = mx.uint32 if dtype == mx.float32 else mx.uint16
+    for rps in (1, 2, 4):
+        for per_group in (d for d in (1, 2, 3, 4) if rows % d == 0):
+            launch = row_exact_qmv.rows_qmv(
+                weight, scales, biases, bits, group_size, "affine", dtype,
+                lambda _, g=(rps, per_group): g,
+            )
+            observed = launch(x)
+            assert observed.shape == expected.shape and observed.dtype == dtype
+            assert mx.array_equal(observed.view(view), expected.view(view)).item(), (
+                rps,
+                per_group,
+            )
