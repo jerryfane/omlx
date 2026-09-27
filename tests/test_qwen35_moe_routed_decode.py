@@ -48,9 +48,13 @@ def _patched_block(monkeypatch):
         delattr(cls, "_omlx_routed_decode")
 
 
-def _block(hidden, inter, top_k=10, bits=4, group_size=64, seed=0, experts=EXPERTS):
+def _block(
+    hidden, inter, top_k=10, bits=4, group_size=64, seed=0, experts=EXPERTS, quantized_shared=True
+):
     """A block laid out like Qwen3.8-Flash-Next oQ: quantized routed experts,
-    8-bit gs128 shared expert, 8-bit gs64 shared-expert gate, bf16 router."""
+    8-bit shared expert (gs128 where the shape allows), 8-bit gs64
+    shared-expert gate, bf16 router. ``quantized_shared=False`` keeps the
+    shared expert and its gate in bf16."""
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 
     from omlx.patches.qwen35_moe_gate_up import apply_qwen35_moe_gate_up_fusion
@@ -68,11 +72,14 @@ def _block(hidden, inter, top_k=10, bits=4, group_size=64, seed=0, experts=EXPER
     sm = block.switch_mlp
     for name in ("gate_proj", "up_proj", "down_proj"):
         setattr(sm, name, getattr(sm, name).to_quantized(group_size, bits))
-    shared = block.shared_expert
-    shared_gs = 128 if hidden % 128 == 0 and inter % 128 == 0 else 64
-    for name in ("gate_proj", "up_proj", "down_proj"):
-        setattr(shared, name, nn.QuantizedLinear.from_linear(getattr(shared, name), shared_gs, 8))
-    block.shared_expert_gate = nn.QuantizedLinear.from_linear(block.shared_expert_gate, 64, 8)
+    if quantized_shared:
+        shared = block.shared_expert
+        shared_gs = 128 if hidden % 128 == 0 and inter % 128 == 0 else 64
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            setattr(
+                shared, name, nn.QuantizedLinear.from_linear(getattr(shared, name), shared_gs, 8)
+            )
+        block.shared_expert_gate = nn.QuantizedLinear.from_linear(block.shared_expert_gate, 64, 8)
     block.eval()
     model = _FakeQwen4Model()
     model.named_modules = lambda: [("mlp.switch_mlp", sm)]
@@ -115,63 +122,102 @@ def test_fused_decode_is_bit_identical(hidden, inter, bits, group_size, monkeypa
         block = _block(hidden, inter, bits=bits, group_size=group_size, seed=seed)
         for step in range(6):
             x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
-            assert routed.routed_decode_plan(block, x) is not None
+            # The shared expert and its gate run inside the two launches.
+            assert routed.routed_decode_plan(block, x).fold
             ref, out = _pair(block, x)
             assert _same_bits(ref, out)
     assert len(calls) == 12
     assert not routed._DISABLED
 
 
+def test_bf16_shared_expert_stays_composed_and_bit_identical():
+    block = _block(2560, 640, bits=5, quantized_shared=False)
+    for step in range(4):
+        x = (mx.random.normal((1, 1, 2560)) * (0.5 + step)).astype(mx.bfloat16)
+        assert not routed.routed_decode_plan(block, x).fold
+        ref, out = _pair(block, x)
+        assert _same_bits(ref, out)
+    assert routed._PROVEN and not routed._DISABLED
+
+
 @pytest.mark.parametrize("bits", [4, 5])
 def test_fp32_kernels_match_mlx_mat_vecs(bits):
-    """BF16 outputs hide one-ulp FP32 differences, so run both kernels in
-    FP32 against MLX's FP32 gather_qmm: the gate+up rows after SwiGLU, and
-    each expert's down rows (read one at a time through the combine with a
-    one-hot score and a zero shared gate)."""
+    """BF16 outputs hide one-ulp FP32 differences, so run both launches in
+    FP32 against MLX's FP32 mat-vecs: the gate+up rows after SwiGLU of the
+    experts and the shared expert plus the gate row, then every down row
+    read through the combine (a one-hot score with the gate at sigmoid 0
+    reads one expert; zero scores with the gate at sigmoid 1 the shared one)."""
     from mlx_vlm.models.activations import swiglu
 
     hidden, inter, gs, top_k = 2560, 640, 64, routed.TOP_K
+    f32 = mx.float32
     mx.random.seed(40 + bits)
-    gu_w, gu_s, gu_b = mx.quantize(
-        mx.random.normal((EXPERTS, 2 * inter, hidden)) * 0.05, gs, bits
+
+    def quantized(shape, group_size, b):
+        return mx.quantize(mx.random.normal(shape) * 0.05, group_size, b)
+
+    def qmm(x, weights, group_size, b):
+        return mx.quantized_matmul(x, *weights, transpose=True, group_size=group_size, bits=b)
+
+    experts_gate_up = quantized((EXPERTS, 2 * inter, hidden), gs, bits)
+    experts_down = quantized((EXPERTS, hidden, inter), gs, bits)
+    shared_gate, shared_up = quantized((inter, hidden), 128, 8), quantized((inter, hidden), 128, 8)
+    shared_down = quantized((hidden, inter), 128, 8)
+    gate_row = quantized((1, hidden), 64, 8)
+    fmt = routed._Format
+    gate_up_kernel = routed._gate_up_kernel(
+        fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, False)
     )
-    d_w, d_s, d_b = mx.quantize(mx.random.normal((EXPERTS, hidden, inter)) * 0.05, gs, bits)
-    zero = mx.zeros((hidden,), mx.float32)
-    off = mx.array([-1e30], mx.float32)  # sigmoid(off) == 0
+    down_kernel = routed._down_kernel(fmt(bits, gs, False), fmt(8, 128, False))
     for step in range(3):
         x = mx.random.normal((1, 1, hidden)) * (0.5 + step)
         ids = mx.random.permutation(EXPERTS)[:top_k].astype(mx.uint32)
-        ref = mx.gather_qmm(
-            mx.expand_dims(x, (-2, -3)), gu_w, gu_s, gu_b, rhs_indices=ids.reshape(1, 1, top_k),
+        routed_gate_up = mx.gather_qmm(
+            mx.expand_dims(x, (-2, -3)), *experts_gate_up, rhs_indices=ids.reshape(1, 1, top_k),
             transpose=True, group_size=gs, bits=bits, sorted_indices=False,
         )
-        gate, up = mx.split(ref, 2, axis=-1)
-        ref_h = swiglu(gate, up).reshape(top_k, inter)
-        h = routed._gate_up_kernel(bits, gs)(
-            inputs=[x, gu_w, gu_s, gu_b, ids],
-            template=[("T", mx.float32), ("K", hidden), ("N", 2 * inter), ("RPS", 2), ("NSG", 2)],
-            grid=(32, inter // 2, top_k),
+        gate, up = mx.split(routed_gate_up, 2, axis=-1)
+        ref_h = mx.concatenate([
+            swiglu(gate, up).reshape(-1),
+            swiglu(qmm(x, shared_gate, 128, 8), qmm(x, shared_up, 128, 8)).reshape(-1),
+            qmm(x, gate_row, 64, 8).reshape(-1),
+        ])
+        h = gate_up_kernel(
+            inputs=[x, *experts_gate_up, ids, *shared_gate, *shared_up, *gate_row],
+            template=[
+                ("T", f32), ("K", hidden), ("NI", inter), ("RPS", 2), ("NSG", 2), ("NS", inter),
+            ],
+            grid=(32, 2 * (1 + inter // 4 + top_k * inter // 4), 1),
             threadgroup=(32, 2, 1),
-            output_shapes=[(top_k, inter)],
-            output_dtypes=[mx.float32],
+            output_shapes=[ref_h.shape],
+            output_dtypes=[f32],
         )[0]
         assert mx.array_equal(h.view(mx.uint32), ref_h.view(mx.uint32)).item()
-        ref_d = mx.gather_qmm(
-            mx.expand_dims(h, -2), d_w, d_s, d_b, rhs_indices=ids, transpose=True,
-            group_size=gs, bits=bits, sorted_indices=False,
+
+        ref_down = mx.gather_qmm(
+            mx.expand_dims(h[: top_k * inter].reshape(top_k, inter), -2), *experts_down,
+            rhs_indices=ids, transpose=True, group_size=gs, bits=bits, sorted_indices=False,
         ).reshape(top_k, hidden)
-        for j in range(top_k):
-            one_hot = (mx.arange(top_k) == j).astype(mx.float32)
-            row = routed._down_kernel(bits, gs)(
-                inputs=[zero, off, h, d_w, d_s, d_b, ids, one_hot],
-                template=[("T", mx.float32), ("K", inter), ("N", hidden), ("RPS", 4)],
-                grid=(32, top_k * hidden // 4, 1),
-                threadgroup=(32, top_k, 1),
+        ref_shared = qmm(h[top_k * inter : -1], shared_down, 128, 8)
+        for j in range(top_k + 1):
+            scores = (mx.arange(top_k) == j).astype(f32)
+            saturated_gate = mx.array([-1e30 if j < top_k else 1e30], f32)
+            row = down_kernel(
+                inputs=[
+                    mx.concatenate([h[:-1], saturated_gate]), *experts_down, *shared_down, ids,
+                    scores,
+                ],
+                template=[
+                    ("T", f32), ("K", inter), ("N", hidden), ("RPS", 4), ("KS", inter),
+                    ("NPART", top_k + 1),
+                ],
+                grid=(32, (top_k + 1) * hidden // 4, 1),
+                threadgroup=(32, top_k + 1, 1),
                 output_shapes=[(hidden,)],
-                output_dtypes=[mx.float32],
+                output_dtypes=[f32],
             )[0]
-            # The +0 folds of the k-sum turn -0 into +0, so compare values.
-            assert mx.array_equal(row, ref_d[j]).item()
+            # The +0 folds of the combine turn -0 into +0, so compare values.
+            assert mx.array_equal(row, ref_down[j] if j < top_k else ref_shared).item()
 
 
 def test_experts_past_the_bound_view_are_read_from_the_stacked_weights():
@@ -194,14 +240,21 @@ def test_experts_past_the_bound_view_are_read_from_the_stacked_weights():
         assert _same_bits(ref, out)
 
 
-def test_plan_follows_replaced_expert_weights():
+@pytest.mark.parametrize(
+    "owner,names",
+    [
+        ("switch_mlp", ("gate_up_proj", "down_proj")),
+        ("shared_expert", ("gate_proj", "up_proj", "down_proj")),
+    ],
+)
+def test_plan_follows_replaced_weights(owner, names):
     block = _block(1024, 320, bits=5)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
     first = routed.routed_decode_plan(block, x)
     donor = _block(1024, 320, bits=5, seed=7)
-    for name in ("gate_up_proj", "down_proj"):
+    for name in names:
         for key in ("weight", "scales", "biases"):
-            block.switch_mlp[name][key] = donor.switch_mlp[name][key]
+            block[owner][name][key] = donor[owner][name][key]
     assert routed.routed_decode_plan(block, x) is not first
     ref, out = _pair(block, x)
     assert _same_bits(ref, out)

@@ -1,33 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused routed experts for one-token Qwen3.5-MoE-family decode.
+"""Fused routed and shared experts for one-token Qwen3.5-MoE-family decode.
 
 After the fused router, a one-token MoE block runs its routed experts as the
 gate+up ``gather_qmm``, the compiled SwiGLU and the down ``gather_qmm`` (each
-``gather_qmm`` behind an ``arange`` for its row indices), then one combine
-launch for the score-weighted sum plus the gated shared expert. At batch-one
-decode these launches are short and depend on each other, so this patch runs
-the same arithmetic in two launches:
+``gather_qmm`` behind an ``arange`` for its row indices), the shared expert
+as three ``quantized_matmul`` launches and a SwiGLU, the shared-expert gate
+as one more ``quantized_matmul``, and one combine launch for the
+score-weighted sum plus the gated shared expert. At batch-one decode these
+launches are short and mostly depend on each other, so this patch runs the
+same arithmetic in two launches after the router:
 
-1. gate+up with a SwiGLU epilogue. Each simdgroup computes the gate rows and
-   the matching up rows of one expert with MLX's ``qmv_fast`` lane partition
-   and add order, rounds both to the activation dtype, then applies MLX's
-   ``Sigmoid`` and the two multiplies of the compiled ``swiglu`` in its order.
+1. gate+up with a SwiGLU epilogue, for the ten selected experts and the
+   shared expert, plus the shared-expert gate row. Each simdgroup computes
+   the gate rows and the matching up rows of one expert with MLX's
+   ``qmv_fast`` lane partition and add order, rounds both to the activation
+   dtype, then applies MLX's ``Sigmoid`` and the two multiplies of the
+   compiled ``swiglu`` in its order. The gate row follows MLX's ``qmv`` for
+   a one-row output; its threadgroup comes first in the grid, so its long
+   serial K walk overlaps the expert rows.
 2. down with the combine. Simdgroup ``j`` of a threadgroup runs the stock
    ``qmv`` work (including its guarded K tail) of selected expert ``j`` for
-   the threadgroup's rows. Each row is rounded, then the combine of
-   ``qwen35_moe_router.fused_moe_combine`` follows: score products summed in
-   MLX's ``col_reduce_small`` order, plus ``sigmoid(shared_gate) * shared``.
+   the threadgroup's rows, one more simdgroup the shared expert's. Each row
+   is rounded, then the combine of ``qwen35_moe_router.fused_moe_combine``
+   follows: score products summed in MLX's ``col_reduce_small`` order, plus
+   ``sigmoid(shared_gate) * shared``.
 
 The result is bit-identical to the composed path. The quantized dot products
 reuse the MLX 0.32.2 transcription in ``moe_verify_gather`` (4, 5, 6 and
-8 bits; group size 32, 64 or 128). MLX picks ``qmv_fast`` when K % 512 == 0
-and N % 8 == 0 and ``qmv`` otherwise, so only shapes where gate+up takes
-``qmv_fast`` and down takes ``qmv`` are routed: one bf16 token, top-k 10,
-affine experts with bf16 scales, hidden % 512 == 0 and intermediate
-% 512 != 0 (Qwen3.8-Flash-Next: 2560 and 640, 4-bit or oQ5e's 5-bit).
-Prefill, verify rows and every other shape keep the original body. If the
-first launch fails, the patch disables itself and the block keeps its
-composed body. ``OMLX_QWEN35_MOE_ROUTED_DECODE=0`` keeps the composed body.
+8 bits; group size 32, 64 or 128), one instantiation per weight format. MLX
+picks ``qmv_fast`` when K % 512 == 0 and N % 8 == 0 and ``qmv`` otherwise.
+Routed experts are taken where gate+up takes ``qmv_fast`` and down takes
+``qmv``: one bf16 token, top-k 10, affine experts with bf16 scales,
+hidden % 512 == 0 and intermediate % 512 != 0 (Qwen3.8-Flash-Next: 2560 and
+640, 4-bit or oQ5e's 5-bit). A shared expert or gate outside that format
+(unquantized, packed, ...) runs as composed launches and only its outputs
+enter the combine. Prefill, verify rows and every other shape keep the
+original body. If the first launch fails, the patch disables itself and the
+block keeps its composed body. ``OMLX_QWEN35_MOE_ROUTED_DECODE=0`` keeps the
+composed body; ``OMLX_QWEN35_MOE_SHARED_FOLD=0`` keeps the shared expert and
+its gate as composed launches.
 
 MLX commits a command buffer once the inputs bound to it exceed its size cap
 (50 MB by default), counting each input array whole. The stacked expert
@@ -47,6 +58,7 @@ from functools import cache
 from typing import NamedTuple
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from .module_cache import cached_per_module
@@ -60,124 +72,199 @@ _GATE_UP_ROWS = 2  # gate rows (and as many up rows) per simdgroup
 _GATE_UP_SIMDGROUPS = 2
 _DOWN_ROWS = 4
 _ENABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTED_DECODE", "1") != "0"
+_SHARED_FOLD = os.environ.get("OMLX_QWEN35_MOE_SHARED_FOLD", "1") != "0"
 _VIEWS_ENABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTED_DECODE_VIEWS", "1") != "0"
 _DISABLED = False
 _PROVEN = False
 
-_SIGMOID = r"""
+
+class _Format(NamedTuple):
+    """One weight format: MLX's ``qmv_fast`` (fast) or ``qmv`` traversal."""
+
+    bits: int
+    group_size: int
+    fast: bool
+
+
+# Rows of one mat-vec, per format namespace: MLX's qmv_fast (FAST) or qmv
+# traversal (full K blocks, then the guarded tail) of one input vector. Rows
+# [0, NA) are rows row_a.. of (wa, sa, ba), rows [NA, NA + NB) rows row_b..
+# of (wb, sb, bb); result[row] ends as the row's simd_sum.
+_ROWS = r"""
+template <typename T, int K, int NA, int NB>
+METAL_FUNC void qmv_rows(
+    const device uint8_t* wa,
+    const device T* sa,
+    const device T* ba,
+    size_t row_a,
+    const device uint8_t* wb,
+    const device T* sb,
+    const device T* bb,
+    size_t row_b,
+    const device T* x,
+    uint simd_lid,
+    thread float* result) {
+  constexpr int in_vec_size_w = K * BYTES_PER_PACK / PACK_FACTOR;
+  constexpr int in_vec_size_g = K / GS;
+  const int lane_w = int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
+  const int lane_g = int(simd_lid) / SCALE_STEP_PER_THREAD;
+  wa += row_a * in_vec_size_w + lane_w;
+  sa += row_a * in_vec_size_g + lane_g;
+  ba += row_a * in_vec_size_g + lane_g;
+  wb += row_b * in_vec_size_w + lane_w;
+  sb += row_b * in_vec_size_g + lane_g;
+  bb += row_b * in_vec_size_g + lane_g;
+  x += int(simd_lid) * VALUES_PER_THREAD;
+
+  float x_thread[VALUES_PER_THREAD];
+  for (int row = 0; row < NA + NB; row++) {
+    result[row] = 0;
+  }
+  int k = 0;
+  for (; k < (FAST ? K : K - BLOCK_SIZE); k += BLOCK_SIZE) {
+    float sum = load_vector<T>(x, x_thread);
+    for (int row = 0; row < NA + NB; row++) {
+      const bool a = row < NA;
+      const int r = a ? row : row - NA;
+      const device uint8_t* wl = (a ? wa : wb) + r * in_vec_size_w;
+      float s = (a ? sa : sb)[r * in_vec_size_g];
+      float b = (a ? ba : bb)[r * in_vec_size_g];
+      result[row] += qdot_n(wl, x_thread, s, b, sum, VALUES_PER_THREAD);
+    }
+    wa += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    wb += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    sa += BLOCK_SIZE / GS;
+    ba += BLOCK_SIZE / GS;
+    sb += BLOCK_SIZE / GS;
+    bb += BLOCK_SIZE / GS;
+    x += BLOCK_SIZE;
+  }
+  if (!FAST) {
+    const int remaining = clamp(
+        int(K - k - int(simd_lid) * VALUES_PER_THREAD), 0, VALUES_PER_THREAD);
+    if (remaining > 0) {
+      float sum = load_vector_safe<T>(x, x_thread, remaining);
+      for (int row = 0; row < NA + NB; row++) {
+        const bool a = row < NA;
+        const int r = a ? row : row - NA;
+        const device uint8_t* wl = (a ? wa : wb) + r * in_vec_size_w;
+        float s = (a ? sa : sb)[r * in_vec_size_g];
+        float b = (a ? ba : bb)[r * in_vec_size_g];
+        result[row] += qdot_n(wl, x_thread, s, b, sum, remaining);
+      }
+    }
+  }
+  for (int row = 0; row < NA + NB; row++) {
+    result[row] = simd_sum(result[row]);
+  }
+}
+"""
+
+_COMMON = r"""
+using namespace metal;
+
 // MLX 0.32.2 Sigmoid, evaluated in T as the compiled swiglu does.
 template <typename U>
 inline U omlx_mlx_sigmoid(U x) {
   auto y = 1 / (1 + metal::exp(metal::abs(x)));
   return (x < 0) ? y : 1 - y;
 }
+
+// swiglu(gate, up) of the compiled mlx-vlm activation: both rounded to T,
+// silu(gate) = gate * sigmoid(gate), then times up, each op in T.
+template <typename T, int RPS>
+METAL_FUNC void swiglu_store(thread const float* result, device T* yp, uint simd_lid) {
+  if (simd_lid == 0) {
+    for (int row = 0; row < RPS; row++) {
+      T g = static_cast<T>(result[row]);
+      T u = static_cast<T>(result[row + RPS]);
+      T t = g * omlx_mlx_sigmoid<T>(g);
+      yp[row] = t * u;
+    }
+  }
+}
 """
 
-# One threadgroup per (expert slot z, block of NSG * RPS output rows). Output
-# is [TOP_K, N / 2] = silu(gate) * up.
-_GATE_UP_SOURCE = r"""
+# One threadgroup of NSG simdgroups (each RPS gate + RPS up rows) per row
+# block b = threadgroup y, blocks in order: [the shared-expert gate row, the
+# NS / (NSG * RPS) shared-expert blocks,] then NI / (NSG * RPS) blocks per
+# selected expert. Output y holds silu(gate) * up of the TOP_K experts ([10,
+# NI]), then [those NS rows of the shared expert, then the gate row].
+_GATE_UP_HEAD = r"""
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    constexpr int ROWS = NSG * RPS;
+    int b = int(threadgroup_position_in_grid.y);
+    float result[2 * RPS];
+"""
+
+_GATE_UP_SHARED = r"""
+    if (b == 0) {
+      // shared_expert_gate: MLX's qmv for its one output row. First in the
+      // grid, so its serial K walk overlaps the expert blocks.
+      if (simd_gid == 0) {
+        gt::qmv_rows<T, K, 1, 0>(
+            (const device uint8_t*)g_w, g_s, g_b, 0,
+            (const device uint8_t*)g_w, g_s, g_b, 0,
+            x, simd_lid, result);
+        if (simd_lid == 0) {
+          y[10 * NI + NS] = static_cast<T>(result[0]);
+        }
+      }
+      return;
+    }
+    if (b <= NS / ROWS) {
+      const int out_row = (b - 1) * ROWS + int(simd_gid) * RPS;
+      st::qmv_rows<T, K, RPS, RPS>(
+          (const device uint8_t*)sg_w, sg_s, sg_b, out_row,
+          (const device uint8_t*)su_w, su_s, su_b, out_row,
+          x, simd_lid, result);
+      swiglu_store<T, RPS>(result, y + 10 * NI + out_row, simd_lid);
+      return;
+    }
+    b -= 1 + NS / ROWS;
+"""
+
+_GATE_UP_ROUTED = r"""
+    const int slot = b / (NI / ROWS);
+    const int out_row = (b % (NI / ROWS)) * ROWS + int(simd_gid) * RPS;
+    const size_t expert = size_t(rhs[slot]);
+    rt::qmv_rows<T, K, RPS, RPS>(
+        (const device uint8_t*)w, scales, biases, expert * (2 * NI) + out_row,
+        (const device uint8_t*)w, scales, biases, expert * (2 * NI) + NI + out_row,
+        x, simd_lid, result);
+    swiglu_store<T, RPS>(result, y + size_t(slot) * NI + out_row, simd_lid);
+"""
+
+# Threadgroup (32, NPART): simdgroup j < TOP_K computes RPS rows of selected
+# expert j (simdgroup TOP_K the shared expert's), then simdgroup 0 combines.
+# Output is [N].
+_DOWN_HEAD = r"""
     const uint3 tid = threadgroup_position_in_grid;
     const uint simd_gid = simdgroup_index_in_threadgroup;
     const uint simd_lid = thread_index_in_simdgroup;
-    const int in_vec_size_w = K * BYTES_PER_PACK / PACK_FACTOR;
-    const int in_vec_size_g = K / GS;
-    const int out_row = int(tid.y) * (NSG * RPS) + int(simd_gid) * RPS;
-    const size_t expert = size_t(rhs[tid.z]);
-
-    const device uint8_t* ws = (const device uint8_t*)w +
-        expert * N * in_vec_size_w + out_row * in_vec_size_w +
-        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-    const device T* sc = scales + expert * N * in_vec_size_g +
-        out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* bs = biases + expert * N * in_vec_size_g +
-        out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* xp = x + int(simd_lid) * VALUES_PER_THREAD;
-
-    float x_thread[VALUES_PER_THREAD];
-    float result[2 * RPS] = {0};
-
-    for (int k = 0; k < K; k += BLOCK_SIZE) {
-      float sum = load_vector<T>(xp, x_thread);
-      for (int row = 0; row < 2 * RPS; row++) {
-        const int r = row < RPS ? row : N / 2 + row - RPS;
-        const device uint8_t* wl = ws + r * in_vec_size_w;
-        float s = sc[r * in_vec_size_g];
-        float b = bs[r * in_vec_size_g];
-        result[row] += qdot_n(wl, x_thread, s, b, sum, VALUES_PER_THREAD);
-      }
-      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-      sc += BLOCK_SIZE / GS;
-      bs += BLOCK_SIZE / GS;
-      xp += BLOCK_SIZE;
-    }
-
-    for (int row = 0; row < 2 * RPS; row++) {
-      result[row] = simd_sum(result[row]);
-    }
-    if (simd_lid == 0) {
-      device T* yp = y + size_t(tid.z) * (N / 2) + out_row;
-      for (int row = 0; row < RPS; row++) {
-        T g = static_cast<T>(result[row]);
-        T u = static_cast<T>(result[row + RPS]);
-        T t = g * omlx_mlx_sigmoid<T>(g);
-        yp[row] = t * u;
-      }
-    }
-"""
-
-# Threadgroup (32, TOP_K): simdgroup j computes RPS rows of selected expert j,
-# then simdgroup 0 combines the rows with the shared expert. Output is [N].
-_DOWN_SOURCE = r"""
-    const uint3 tid = threadgroup_position_in_grid;
-    const uint simd_gid = simdgroup_index_in_threadgroup;
-    const uint simd_lid = thread_index_in_simdgroup;
-    const int in_vec_size_w = K * BYTES_PER_PACK / PACK_FACTOR;
-    const int in_vec_size_g = K / GS;
     const int out_row = int(tid.y) * RPS;
     const int slot = int(simd_gid);
-    const size_t expert = size_t(rhs[slot]);
-    threadgroup T part[10 * RPS];
+    threadgroup T part[NPART * RPS];
+    float result[RPS];
+"""
 
-    const device uint8_t* ws = (const device uint8_t*)w +
-        expert * N * in_vec_size_w + out_row * in_vec_size_w +
-        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-    const device T* sc = scales + expert * N * in_vec_size_g +
-        out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* bs = biases + expert * N * in_vec_size_g +
-        out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* xp = x + slot * K + int(simd_lid) * VALUES_PER_THREAD;
+_DOWN_SHARED_ROWS = r"""
+    if (slot == 10) {
+      sd::qmv_rows<T, KS, RPS, 0>(
+          (const device uint8_t*)sd_w, sd_s, sd_b, out_row,
+          (const device uint8_t*)sd_w, sd_s, sd_b, out_row,
+          x + 10 * K, simd_lid, result);
+    } else
+"""
 
-    float x_thread[VALUES_PER_THREAD];
-    float result[RPS] = {0};
-
-    int k = 0;
-    for (; k < K - BLOCK_SIZE; k += BLOCK_SIZE) {
-      float sum = load_vector<T>(xp, x_thread);
-      for (int row = 0; row < RPS; row++) {
-        const device uint8_t* wl = ws + row * in_vec_size_w;
-        float s = sc[row * in_vec_size_g];
-        float b = bs[row * in_vec_size_g];
-        result[row] += qdot_n(wl, x_thread, s, b, sum, VALUES_PER_THREAD);
-      }
-      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-      sc += BLOCK_SIZE / GS;
-      bs += BLOCK_SIZE / GS;
-      xp += BLOCK_SIZE;
-    }
-    const int remaining = clamp(
-        int(K - k - int(simd_lid) * VALUES_PER_THREAD), 0, VALUES_PER_THREAD);
-    if (remaining > 0) {
-      float sum = load_vector_safe<T>(xp, x_thread, remaining);
-      for (int row = 0; row < RPS; row++) {
-        const device uint8_t* wl = ws + row * in_vec_size_w;
-        float s = sc[row * in_vec_size_g];
-        float b = bs[row * in_vec_size_g];
-        result[row] += qdot_n(wl, x_thread, s, b, sum, remaining);
-      }
-    }
-
-    for (int row = 0; row < RPS; row++) {
-      result[row] = simd_sum(result[row]);
+_DOWN_TAIL = r"""
+    {
+      const size_t expert = size_t(rhs[slot]);
+      rd::qmv_rows<T, K, RPS, 0>(
+          (const device uint8_t*)w, scales, biases, expert * N + out_row,
+          (const device uint8_t*)w, scales, biases, expert * N + out_row,
+          x + slot * K, simd_lid, result);
     }
     if (simd_lid == 0) {
       for (int row = 0; row < RPS; row++) {
@@ -202,54 +289,88 @@ _DOWN_SOURCE = r"""
       for (int l = 1; l < 8; ++l) {
         acc = T(float(lane[l]) + float(acc));
       }
-      const float g = float(gate[0]);
+      const float g = float(GATE_VALUE);
       const T e = T(1.0f + float(T(metal::precise::exp(metal::abs(g)))));
       const T sy = T(metal::precise::divide(1.0f, float(e)));
       const T sg = g < 0.0f ? sy : T(1.0f - float(sy));
-      const T sh = T(float(sg) * float(shared[h]));
+      const T sh = T(float(sg) * float(SHARED_VALUE));
       y[h] = T(float(acc) + float(sh));
     }
 """
 
 
-def _header(bits: int, group_size: int, fast: bool) -> str:
-    return (
-        _QMV_HEADER.replace("__BITS__", str(bits))
-        .replace("__GS__", str(group_size))
-        .replace("__FAST__", "1" if fast else "0")
-        + _SIGMOID
+def _format_header(namespace: str, fmt: _Format) -> str:
+    header = (
+        _QMV_HEADER.replace("__BITS__", str(fmt.bits))
+        .replace("__GS__", str(fmt.group_size))
+        .replace("__FAST__", "1" if fmt.fast else "0")
+    )
+    return f"namespace {namespace} {{\n{header}\n{_ROWS}\n}}  // namespace {namespace}\n"
+
+
+def _name(fmt: _Format) -> str:
+    return f"b{fmt.bits}g{fmt.group_size}{'f' if fmt.fast else 's'}"
+
+
+@cache
+def _gate_up_kernel(routed: _Format, shared: _Format | None, gate: _Format | None):
+    """Gate+up/SwiGLU launch; with ``shared`` (and ``gate``) it also runs the
+    shared expert's gate+up and the shared-expert gate row."""
+    header = _COMMON + _format_header("rt", routed)
+    inputs = ["x", "w", "scales", "biases", "rhs"]
+    source = _GATE_UP_HEAD
+    name = f"omlx_qwen35_moe_gate_up_decode_{_name(routed)}"
+    if shared is not None:
+        header += _format_header("st", shared) + _format_header("gt", gate)
+        inputs += ["sg_w", "sg_s", "sg_b", "su_w", "su_s", "su_b", "g_w", "g_s", "g_b"]
+        source += _GATE_UP_SHARED
+        name += f"_shared_{_name(shared)}_gate_{_name(gate)}"
+    return mx.fast.metal_kernel(
+        name=name,
+        input_names=inputs,
+        output_names=["y"],
+        header=header,
+        source=source + _GATE_UP_ROUTED,
     )
 
 
 @cache
-def _gate_up_kernel(bits: int, group_size: int):
+def _down_kernel(routed: _Format, shared: _Format | None):
+    """Down/combine launch; with ``shared`` it also runs the shared expert's
+    down rows, otherwise the shared expert's output is an input."""
+    header = _COMMON + _format_header("rd", routed)
+    name = f"omlx_qwen35_moe_down_combine_decode_{_name(routed)}"
+    if shared is None:
+        inputs = ["shared", "gate", "x", "w", "scales", "biases", "rhs", "scores"]
+        source = _DOWN_HEAD + _DOWN_TAIL.replace("SHARED_VALUE", "shared[h]").replace(
+            "GATE_VALUE", "gate[0]"
+        )
+    else:
+        header += _format_header("sd", shared)
+        # x is the gate+up output: expert rows, shared rows, gate row.
+        inputs = ["x", "w", "scales", "biases", "sd_w", "sd_s", "sd_b", "rhs", "scores"]
+        source = (
+            _DOWN_HEAD
+            + _DOWN_SHARED_ROWS
+            + _DOWN_TAIL.replace("SHARED_VALUE", "part[10 * RPS + int(simd_lid)]").replace(
+                "GATE_VALUE", "x[10 * K + KS]"
+            )
+        )
+        name += f"_shared_{_name(shared)}"
     return mx.fast.metal_kernel(
-        name=f"omlx_qwen35_moe_gate_up_swiglu_decode_b{bits}_gs{group_size}",
-        input_names=["x", "w", "scales", "biases", "rhs"],
+        name=name,
+        input_names=inputs,
         output_names=["y"],
-        header=_header(bits, group_size, fast=True),
-        source=_GATE_UP_SOURCE,
+        header=header,
+        source=source,
     )
 
 
-@cache
-def _down_kernel(bits: int, group_size: int):
-    return mx.fast.metal_kernel(
-        name=f"omlx_qwen35_moe_down_combine_decode_b{bits}_gs{group_size}",
-        input_names=["shared", "gate", "x", "w", "scales", "biases", "rhs", "scores"],
-        output_names=["y"],
-        header=_header(bits, group_size, fast=False),
-        source=_DOWN_SOURCE,
-    )
-
-
-def _quantized_ok(layer) -> bool:
-    # The type the served decode plan (qwen35_moe_gate_up) runs as a bare
-    # gather_qmm; subclasses may override the call.
-    from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
-
+def _quantized_ok(layer, cls) -> bool:
+    # Exactly the class whose call is a bare quantized_matmul / gather_qmm;
+    # subclasses and repacked layers may compute differently.
     return (
-        type(layer) is QuantizedSwitchLinear
+        type(layer) is cls
         and layer.bits in _BITS
         and layer.group_size in _GROUP_SIZES
         and layer.mode == "affine"
@@ -258,6 +379,14 @@ def _quantized_ok(layer) -> bool:
         and layer["scales"].dtype == mx.bfloat16
         and layer["biases"].dtype == mx.bfloat16
     )
+
+
+def _mlx_format(layer, k: int, n: int) -> _Format | None:
+    """The format MLX's one-row mat-vec runs for ``layer`` ([n, k] weights),
+    or None when the packed shape does not match."""
+    if layer["weight"].shape[-2:] != (n, k * layer.bits // 32) or k % layer.group_size:
+        return None
+    return _Format(layer.bits, layer.group_size, k % 512 == 0 and n % 8 == 0)
 
 
 def _address(a: mx.array) -> int:
@@ -280,65 +409,137 @@ def _expert_view(a: mx.array) -> mx.array:
 
 class _Plan(NamedTuple):
     hidden: int
+    fold: bool  # shared expert and its gate run inside the two launches
     gate_up_kernel: object
     gate_up_operands: tuple
     gate_up_template: list
     gate_up_grid: tuple
+    gate_up_output: tuple
     down_kernel: object
     down_operands: tuple
     down_template: list
     down_grid: tuple
-    h_shape: tuple
+    down_threadgroup: tuple
+    shared_gate_up_operands: tuple = ()  # gate_proj, up_proj, gate (fold)
+    shared_down_operands: tuple = ()  # down_proj (fold)
 
 
-def _build_plan(switch_mlp) -> _Plan | None:
-    """Kernels and operands for one SwitchGLU, or None outside the layout."""
-    from mlx_vlm.models.switch_layers import SwiGLU
+def _shared_formats(block, hidden: int):
+    """(gate+up, down, gate) formats and operands of a foldable shared
+    expert and gate, or None."""
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
 
-    if switch_mlp.training or type(switch_mlp.get("activation")) is not SwiGLU:
+    shared, gate = block.get("shared_expert"), block.get("shared_expert_gate")
+    if type(shared) is not Qwen3_5MLP:
+        return None
+    layers = (shared.get("gate_proj"), shared.get("up_proj"), shared.get("down_proj"), gate)
+    if not all(_quantized_ok(layer, nn.QuantizedLinear) for layer in layers):
+        return None
+    gate_proj, up_proj, down_proj, _ = layers
+    width = gate_proj["weight"].shape[0]
+    gu_fmt = _mlx_format(gate_proj, hidden, width)
+    d_fmt = _mlx_format(down_proj, width, hidden)
+    g_fmt = _mlx_format(gate, hidden, 1)
+    if (
+        gu_fmt is None
+        or d_fmt is None
+        or g_fmt is None
+        or _mlx_format(up_proj, hidden, width) != gu_fmt
+        or width % (_GATE_UP_ROWS * _GATE_UP_SIMDGROUPS)
+    ):
+        return None
+    operands = lambda layer: tuple(layer[k] for k in ("weight", "scales", "biases"))
+    return (
+        width,
+        gu_fmt,
+        d_fmt,
+        g_fmt,
+        operands(gate_proj) + operands(up_proj) + operands(gate),
+        operands(down_proj),
+    )
+
+
+def _build_plan(block) -> _Plan | None:
+    """Kernels and operands for one MoE block, or None outside the layout."""
+    from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwiGLU
+
+    switch_mlp = block.get("switch_mlp")
+    if block.training or switch_mlp is None:
+        return None
+    if type(switch_mlp.get("activation")) is not SwiGLU:
         return None
     gate_up = switch_mlp.get("gate_up_proj")
     down = switch_mlp.get("down_proj")
-    if gate_up is None or down is None:
-        return None
-    if not (_quantized_ok(gate_up) and _quantized_ok(down)):
-        return None
-    gu_bits, d_bits = gate_up.bits, down.bits
-    hidden = down["weight"].shape[1]
-    inter = down["weight"].shape[-1] * 32 // d_bits
     if not (
-        hidden % 512 == 0
-        and inter % 512 != 0
-        and inter % down.group_size == 0
-        and gate_up["weight"].shape[1:] == (2 * inter, hidden * gu_bits // 32)
-        and down["weight"].shape[1:] == (hidden, inter * d_bits // 32)
-        and gate_up["weight"].shape[0] == down["weight"].shape[0]
+        _quantized_ok(gate_up, QuantizedSwitchLinear)
+        and _quantized_ok(down, QuantizedSwitchLinear)
+    ):
+        return None
+    hidden = down["weight"].shape[1]
+    inter = down["weight"].shape[-1] * 32 // down.bits
+    gu_fmt = _mlx_format(gate_up, hidden, 2 * inter)
+    d_fmt = _mlx_format(down, inter, hidden)
+    if (
+        gu_fmt is None
+        or d_fmt is None
+        or not gu_fmt.fast
+        or d_fmt.fast
+        or gate_up["weight"].shape[0] != down["weight"].shape[0]
     ):
         return None
     view = _expert_view if _VIEWS_ENABLED else (lambda a: a)
+    gate_up_operands = tuple(view(gate_up[k]) for k in ("weight", "scales", "biases"))
+    down_operands = tuple(view(down[k]) for k in ("weight", "scales", "biases"))
+    shared = _shared_formats(block, hidden) if _SHARED_FOLD else None
     rows = _GATE_UP_ROWS * _GATE_UP_SIMDGROUPS
+    gate_up_template = [
+        ("T", mx.bfloat16),
+        ("K", hidden),
+        ("NI", inter),
+        ("RPS", _GATE_UP_ROWS),
+        ("NSG", _GATE_UP_SIMDGROUPS),
+    ]
+    down_template = [
+        ("T", mx.bfloat16),
+        ("K", inter),
+        ("N", hidden),
+        ("RPS", _DOWN_ROWS),
+    ]
+    if shared is None:
+        return _Plan(
+            hidden=hidden,
+            fold=False,
+            gate_up_kernel=_gate_up_kernel(gu_fmt, None, None),
+            gate_up_operands=gate_up_operands,
+            gate_up_template=gate_up_template,
+            gate_up_grid=(32, _GATE_UP_SIMDGROUPS * TOP_K * inter // rows, 1),
+            gate_up_output=(TOP_K, inter),
+            down_kernel=_down_kernel(d_fmt, None),
+            down_operands=down_operands,
+            down_template=down_template + [("NPART", TOP_K)],
+            down_grid=(32, TOP_K * hidden // _DOWN_ROWS, 1),
+            down_threadgroup=(32, TOP_K, 1),
+        )
+    width, sgu_fmt, sd_fmt, g_fmt, shared_gate_up, shared_down = shared
     return _Plan(
         hidden=hidden,
-        gate_up_kernel=_gate_up_kernel(gu_bits, gate_up.group_size),
-        gate_up_operands=tuple(view(gate_up[k]) for k in ("weight", "scales", "biases")),
-        gate_up_template=[
-            ("T", mx.bfloat16),
-            ("K", hidden),
-            ("N", 2 * inter),
-            ("RPS", _GATE_UP_ROWS),
-            ("NSG", _GATE_UP_SIMDGROUPS),
-        ],
-        gate_up_grid=(32, _GATE_UP_SIMDGROUPS * inter // rows, TOP_K),
-        down_kernel=_down_kernel(d_bits, down.group_size),
-        down_operands=tuple(view(down[k]) for k in ("weight", "scales", "biases")),
-        down_template=[
-            ("T", mx.bfloat16),
-            ("K", inter),
-            ("N", hidden),
-            ("RPS", _DOWN_ROWS),
-        ],
-        down_grid=(32, TOP_K * hidden // _DOWN_ROWS, 1),
-        h_shape=(TOP_K, inter),
+        fold=True,
+        gate_up_kernel=_gate_up_kernel(gu_fmt, sgu_fmt, g_fmt),
+        gate_up_operands=gate_up_operands,
+        gate_up_template=gate_up_template + [("NS", width)],
+        gate_up_grid=(
+            32,
+            _GATE_UP_SIMDGROUPS * (1 + width // rows + TOP_K * inter // rows),
+            1,
+        ),
+        gate_up_output=(TOP_K * inter + width + 1,),
+        down_kernel=_down_kernel(d_fmt, sd_fmt),
+        down_operands=down_operands,
+        down_template=down_template + [("KS", width), ("NPART", TOP_K + 1)],
+        down_grid=(32, (TOP_K + 1) * hidden // _DOWN_ROWS, 1),
+        down_threadgroup=(32, TOP_K + 1, 1),
+        shared_gate_up_operands=shared_gate_up,
+        shared_down_operands=shared_down,
     )
 
 
@@ -349,33 +550,37 @@ def routed_decode_plan(block, x) -> _Plan | None:
     hidden = x.shape[-1]
     if x.size != hidden:
         return None
-    switch_mlp = block.get("switch_mlp")
-    if switch_mlp is None:
-        return None
-    plan = cached_per_module(switch_mlp, "_omlx_routed_decode_plan", _build_plan)
+    # Depth 2 keys the plan on the expert and shared-expert weight arrays.
+    plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
     if plan is None or plan.hidden != hidden:
         return None
     return plan
 
 
-def routed_decode(plan: _Plan, x, indices, scores, shared, gate):
+def routed_decode(plan: _Plan, x, indices, scores, shared=None, gate=None):
     """``(switch_mlp(x, indices) * scores[..., None]).sum(axis=-2)
-    + mx.sigmoid(gate) * shared`` for one token, in two launches."""
+    + mx.sigmoid(shared_expert_gate(x)) * shared_expert(x)`` for one token
+    in two launches. ``shared`` and ``gate`` are the composed shared expert
+    and gate outputs, used only when the plan does not fold them."""
     h = plan.gate_up_kernel(
-        inputs=[x, *plan.gate_up_operands, indices],
+        inputs=[x, *plan.gate_up_operands, indices, *plan.shared_gate_up_operands],
         template=plan.gate_up_template,
         grid=plan.gate_up_grid,
         threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
-        output_shapes=[plan.h_shape],
+        output_shapes=[plan.gate_up_output],
         output_dtypes=[mx.bfloat16],
     )[0]
-    # The shared expert comes first in the inputs, so its launches are
-    # encoded (and can run) before the router's.
+    if plan.fold:
+        down_inputs = [h, *plan.down_operands, *plan.shared_down_operands, indices, scores]
+    else:
+        # The shared expert comes first in the inputs, so its launches are
+        # encoded (and can run) before the router's.
+        down_inputs = [shared, gate, h, *plan.down_operands, indices, scores]
     return plan.down_kernel(
-        inputs=[shared, gate, h, *plan.down_operands, indices, scores],
+        inputs=down_inputs,
         template=plan.down_template,
         grid=plan.down_grid,
-        threadgroup=(32, TOP_K, 1),
+        threadgroup=plan.down_threadgroup,
         output_shapes=[x.shape],
         output_dtypes=[mx.bfloat16],
     )[0]
@@ -407,12 +612,16 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
         plan = routed_decode_plan(self, x)
         if plan is None or not router_eligible(x, self.num_experts):
             return orig_call(self, x)
-        # Children by item: this runs for every MoE layer of every decode step.
-        shared = self["shared_expert"](x)
-        shared_gate = self["shared_expert_gate"](x)
+        shared = shared_gate = None
+        if not plan.fold:
+            # Children by item: this runs for every MoE layer of every decode step.
+            shared = self["shared_expert"](x)
+            shared_gate = self["shared_expert_gate"](x)
+            if shared.dtype != x.dtype or shared_gate.dtype != x.dtype:
+                return orig_call(self, x)
         gates = mx.softmax(self["gate"](x), axis=-1, precise=True)
         inds, scores = fused_router_topk(gates, self.top_k)
-        if scores.dtype != x.dtype or shared.dtype != x.dtype or shared_gate.dtype != x.dtype:
+        if scores.dtype != x.dtype:
             return orig_call(self, x)
         try:
             y = routed_decode(plan, x, inds, scores, shared, shared_gate)
