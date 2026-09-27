@@ -3,10 +3,10 @@
 
 Decode (at most 16 BF16 rows) fuses per-stream RMS norm, down/inject
 projections with activation, and the up projection with stream mixing.
-Prefill keeps the down/up projections on the MLX matmul path and fuses only
-the stream norm and the mixing/inject epilogue. Both need four streams and
-affine group-size-64 projections with 4/5/6/8-bit weights. FP32 epilogues
-can round differently from the canonical BF16 operations.
+Prefill keeps the down/up projections on the MLX matmul path and fuses the
+stream norm, silu(down / HC), and the mixing/inject epilogue. Both need four
+streams and affine group-size-64 projections with 4/5/6/8-bit weights. FP32
+epilogues can round differently from the canonical BF16 operations.
 
 A pending residual write (previous block's branch times its injection gate)
 can be applied inside the stream norm, which also stores the written
@@ -235,47 +235,69 @@ _U_SOURCE = r"""
 # - mixed = mean over streams of sigmoid(up) * normed, with BF16 rounding after
 #   each gate, product and partial sum.
 # - inj = 2 * sigmoid(normed . inject / HC) from the quantized four-row bank.
+# The normed row is read once: each stream is staged in threadgroup memory and
+# its inject dot runs from there. The inject sum keeps one fixed order: virtual
+# thread v = s * VT + t (t < VT) sums elements [v * PER, (v + 1) * PER) of the
+# row, then simd_sum per 32 virtual threads, then the 8 partials in order.
 _TI_SOURCE = r"""
     const uint row = threadgroup_position_in_grid.z;
     const uint t = thread_index_in_threadgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
-    const device T* up_r = up + (size_t)row * K;
-    const device T* xn_r = xn + (size_t)row * K;
-    for (int h = int(t); h < H; h += 256) {
-        float acc = 0.0f;
-        for (int s = 0; s < HC; ++s) {
-            const int n = s * H + h;
-            const T g = T(1.0f / (1.0f + metal::exp(-float(up_r[n]))));
-            const T p = T(float(g) * float(xn_r[n]));
-            acc = s == 0 ? float(p) : float(T(acc + float(p)));
-        }
-        mixed[(size_t)row * H + h] = T(acc * (1.0f / float(HC)));
-    }
+    constexpr int PER_H = (H + 255) / 256;
     constexpr int PF = hc_pack_factor<BITS_I>();
     constexpr int BP = hc_bytes_per_pack<BITS_I>();
     constexpr int ROW_BYTES = K * BP / PF;
     constexpr int GROUPS = K / 64;
     constexpr int PER = K / 256;
-    float res[HC] = {0.0f};
-    float xv[PF];
-    const int e0 = int(t) * PER;
-    for (int e = e0; e < e0 + PER; e += PF) {
-        const float sum = hc_load_vector<T, PF, BITS_I>(xn_r + e, xv);
-        const int g = e / 64;
-        for (int r = 0; r < HC; ++r) {
-            res[r] += hc_qdot<PF, BITS_I>(
-                (const device uint8_t*)inject_w + r * ROW_BYTES + e * BP / PF,
-                xv, float(inject_s[r * GROUPS + g]), float(inject_b[r * GROUPS + g]),
-                sum);
-        }
-    }
+    constexpr int VT = H / PER;
+    static_assert(K == HC * H && H % PER == 0 && VT % 32 == 0 && HC * VT == 256,
+                  "inject chunks must tile each stream");
+    threadgroup T xs[H];
     threadgroup float part[HC][8];
-    for (int r = 0; r < HC; ++r) {
-        const float v = simd_sum(res[r]);
-        if (lane == 0) part[r][sg] = v;
+    const device T* up_r = up + (size_t)row * K;
+    const device T* xn_r = xn + (size_t)row * K;
+    float acc[PER_H];
+    for (int s = 0; s < HC; ++s) {
+        for (int i = 0; i < PER_H; ++i) {
+            const int h = int(t) + i * 256;
+            if (h < H) {
+                const int n = s * H + h;
+                const T x = xn_r[n];
+                xs[h] = x;
+                const T g = T(1.0f / (1.0f + metal::exp(-float(up_r[n]))));
+                const T p = T(float(g) * float(x));
+                acc[i] = s == 0 ? float(p) : float(T(acc[i] + float(p)));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (int(t) < VT) {
+            float res[HC] = {0.0f};
+            float xv[PF];
+            const int e0 = int(t) * PER;
+            for (int e = e0; e < e0 + PER; e += PF) {
+                const float sum = hc_load_vector_tg<T, PF, BITS_I>(xs + e, xv);
+                const int ge = s * H + e;
+                const int g = ge / 64;
+                for (int r = 0; r < HC; ++r) {
+                    res[r] += hc_qdot<PF, BITS_I>(
+                        (const device uint8_t*)inject_w + r * ROW_BYTES + ge * BP / PF,
+                        xv, float(inject_s[r * GROUPS + g]), float(inject_b[r * GROUPS + g]),
+                        sum);
+                }
+            }
+            for (int r = 0; r < HC; ++r) {
+                const float v = simd_sum(res[r]);
+                if (lane == 0) part[r][s * (VT / 32) + int(sg)] = v;
+            }
+        }
+        // Stream s + 1 overwrites xs only after every inject read of stream s.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < PER_H; ++i) {
+        const int h = int(t) + i * 256;
+        if (h < H) mixed[(size_t)row * H + h] = T(acc[i] * (1.0f / float(HC)));
+    }
     if (t < HC) {
         float v = 0.0f;
         for (int i = 0; i < 8; ++i) v += part[t][i];
@@ -283,6 +305,50 @@ _TI_SOURCE = r"""
         const float gate = float(T(1.0f / (1.0f + metal::exp(-q))));
         inj[(size_t)row * HC + t] = T(2.0f * gate);
     }
+"""
+
+# hc_load_vector for a threadgroup-staged vector; same arithmetic as the device form.
+_TG_HEADER = r"""
+template <typename T, int N, int bits>
+inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
+    float sum = 0.0f;
+    if (bits == 4) {
+        for (int i = 0; i < N; i += 4) {
+            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            xt[i] = x[i];
+            xt[i + 1] = x[i + 1] / 16.0f;
+            xt[i + 2] = x[i + 2] / 256.0f;
+            xt[i + 3] = x[i + 3] / 4096.0f;
+        }
+    } else if (bits == 5) {
+        for (int i = 0; i < N; i += 8) {
+            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]
+                + x[i + 4] + x[i + 5] + x[i + 6] + x[i + 7];
+            xt[i] = x[i];
+            xt[i + 1] = x[i + 1] / 32.0f;
+            xt[i + 2] = x[i + 2] / 4.0f;
+            xt[i + 3] = x[i + 3] / 128.0f;
+            xt[i + 4] = x[i + 4] / 16.0f;
+            xt[i + 5] = x[i + 5] / 2.0f;
+            xt[i + 6] = x[i + 6] / 64.0f;
+            xt[i + 7] = x[i + 7] / 8.0f;
+        }
+    } else if (bits == 6) {
+        for (int i = 0; i < N; i += 4) {
+            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            xt[i] = x[i];
+            xt[i + 1] = x[i + 1] / 64.0f;
+            xt[i + 2] = x[i + 2] / 16.0f;
+            xt[i + 3] = x[i + 3] / 4.0f;
+        }
+    } else if (bits == 8) {
+        for (int i = 0; i < N; ++i) {
+            sum += x[i];
+            xt[i] = x[i];
+        }
+    }
+    return sum;
+}
 """
 
 
@@ -537,6 +603,16 @@ def _pack_factor(bits: int) -> int:
 
 
 _TAILS: dict[tuple[int, int], object] = {}
+_ACTS: dict[int, object] = {}
+
+
+def _act(hc: int):
+    """Compiled silu(down / hc): one launch that rounds like the two eager ops."""
+    fn = _ACTS.get(hc)
+    if fn is None:
+        fn = mx.compile(lambda y: nn.silu(y / hc), shapeless=True)
+        _ACTS[hc] = fn
+    return fn
 
 
 def _tail(hc: int, hidden: int):
@@ -582,7 +658,7 @@ def prefill_forward(module, hyper_input, write=None):
             )
             hyper_input = written.reshape(hyper_input.shape)
         normed = normed.reshape(hyper_input.shape)
-        mix = nn.silu(module.input_mix_weight_down(normed) / hc)
+        mix = _act(hc)(module.input_mix_weight_down(normed))
         up = module.input_mix_weight_up(mix)
         inject = module.block_inject_weight if "block_inject_weight" in module else None
         if inject is None or width % (256 * _pack_factor(inject.bits)):
@@ -595,7 +671,7 @@ def prefill_forward(module, hyper_input, write=None):
                 ["up", "xn", "inject_w", "inject_s", "inject_b"],
                 ["mixed", "inj"],
                 _TI_SOURCE,
-                header=_HEADER,
+                header=_HEADER + _TG_HEADER,
             )(
                 inputs=[
                     up.reshape(rows, width),

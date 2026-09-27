@@ -384,6 +384,124 @@ def test_prefill_path_matches_canonical(bits, rows, use_combine, monkeypatch):
     assert max_ulps <= 16 and mean_ulps <= 0.5
 
 
+# The prefill tail/inject arithmetic as originally shipped: one row per threadgroup, the
+# normed row read from device memory for both the mix and the inject dot. Kernel changes
+# must keep these bits (prefix caches and accuracy baselines depend on them).
+_REFERENCE_TAIL_INJECT = r"""
+    const uint row = threadgroup_position_in_grid.z;
+    const uint t = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const device T* up_r = up + (size_t)row * K;
+    const device T* xn_r = xn + (size_t)row * K;
+    for (int h = int(t); h < H; h += 256) {
+        float acc = 0.0f;
+        for (int s = 0; s < HC; ++s) {
+            const int n = s * H + h;
+            const T g = T(1.0f / (1.0f + metal::exp(-float(up_r[n]))));
+            const T p = T(float(g) * float(xn_r[n]));
+            acc = s == 0 ? float(p) : float(T(acc + float(p)));
+        }
+        mixed[(size_t)row * H + h] = T(acc * (1.0f / float(HC)));
+    }
+    constexpr int PF = hc_pack_factor<BITS_I>();
+    constexpr int BP = hc_bytes_per_pack<BITS_I>();
+    constexpr int ROW_BYTES = K * BP / PF;
+    constexpr int GROUPS = K / 64;
+    constexpr int PER = K / 256;
+    float res[HC] = {0.0f};
+    float xv[PF];
+    const int e0 = int(t) * PER;
+    for (int e = e0; e < e0 + PER; e += PF) {
+        const float sum = hc_load_vector<T, PF, BITS_I>(xn_r + e, xv);
+        const int g = e / 64;
+        for (int r = 0; r < HC; ++r) {
+            res[r] += hc_qdot<PF, BITS_I>(
+                (const device uint8_t*)inject_w + r * ROW_BYTES + e * BP / PF,
+                xv, float(inject_s[r * GROUPS + g]), float(inject_b[r * GROUPS + g]),
+                sum);
+        }
+    }
+    threadgroup float part[HC][8];
+    for (int r = 0; r < HC; ++r) {
+        const float v = simd_sum(res[r]);
+        if (lane == 0) part[r][sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < HC) {
+        float v = 0.0f;
+        for (int i = 0; i < 8; ++i) v += part[t][i];
+        const float q = float(T(float(T(v)) / float(HC)));
+        const float gate = float(T(1.0f / (1.0f + metal::exp(-q))));
+        inj[(size_t)row * HC + t] = T(2.0f * gate);
+    }
+"""
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("rows,seed", [(17, 0), (300, 1), (300, 2)])
+def test_prefill_tail_inject_keeps_reference_bits(bits, rows, seed):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(900 + seed * 10 + bits)
+    module = _module(bits)
+    inject = module.block_inject_weight
+    up = (mx.random.normal((rows, WIDTH)) * 3).astype(mx.bfloat16)
+    normed = (mx.random.normal((rows, WIDTH)) * 2).astype(mx.bfloat16)
+
+    def run(name, source, header):
+        return hc_fused._kernel(
+            name,
+            ["up", "xn", "inject_w", "inject_s", "inject_b"],
+            ["mixed", "inj"],
+            source,
+            header=header,
+        )(
+            inputs=[up, normed, inject.weight, inject.scales, inject.biases],
+            template=[
+                ("T", mx.bfloat16),
+                ("BITS_I", bits),
+                ("K", WIDTH),
+                ("H", HIDDEN),
+                ("HC", HC),
+            ],
+            grid=(256, 1, rows),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(rows, HIDDEN), (rows, HC)],
+            output_dtypes=[mx.bfloat16, mx.bfloat16],
+        )
+
+    expected = run(
+        "test_reference_tail_inject", _REFERENCE_TAIL_INJECT, hc_fused._HEADER
+    )
+    actual = run(
+        "omlx_qwen4_hc_prefill_tail_inject",
+        hc_fused._TI_SOURCE,
+        hc_fused._HEADER + hc_fused._TG_HEADER,
+    )
+    mx.eval(expected, actual)
+    for observed, reference in zip(actual, expected):
+        assert mx.array_equal(observed.view(mx.uint16), reference.view(mx.uint16)).item()
+
+
+def test_prefill_activation_rounds_like_eager_ops():
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(5)
+    special = mx.array(
+        [0.0, -0.0, 1e-40, -1e-40, 3e38, -3e38, float("inf"), -float("inf"), float("nan")]
+    )
+    for scale in (1e-38, 1e-3, 1.0, 40.0, 1e5):
+        y = mx.concatenate([mx.random.normal((4096,)) * scale, special]).astype(
+            mx.bfloat16
+        ).reshape(1, -1, 1)
+        expected = nn.silu(y / HC)
+        actual = hc_fused._act(HC)(y)
+        mx.eval(expected, actual)
+        assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16)).item()
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize(
