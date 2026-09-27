@@ -40,19 +40,34 @@ Routed experts are taken where gate+up takes ``qmv_fast`` and down takes
 hidden % 512 == 0 and intermediate % 512 != 0 (Qwen3.8-Flash-Next: 2560 and
 640, 4-bit or oQ5e's 5-bit). A shared expert or gate outside that format
 (unquantized, packed, ...) runs as composed launches and only its outputs
-enter the combine. Prefill, verify rows and every other shape keep the
+enter the combine. Prefill, multi-row calls and every other shape keep the
 original body. If the first launch fails, the patch disables itself and the
 block keeps its composed body. ``OMLX_QWEN35_MOE_ROUTED_DECODE=0`` keeps the
 composed body; ``OMLX_QWEN35_MOE_SHARED_FOLD=0`` keeps the shared expert and
 its gate as composed launches.
 
+Row-exact MTP verify windows (1..8 rows whose logits must equal serial
+decode) run the same arithmetic for the whole window in four launches: the
+router gemv and the softmax + top-k over all rows
+(``qwen35_moe_router.router_gemv`` / ``softmax_topk_rows``), then window
+variants of the two launches above in which each threadgroup serves one row
+with the one-token source verbatim (threadgroups of one weight block for
+consecutive rows are adjacent, so shared experts are fetched once through
+the cache). Every row is bit-identical to the fused one-token call on that
+row. This replaces the verifier's composed MoE (about fifteen launches, two
+of them binding the whole stacked experts) only while row-exact verify is
+armed and the block folds its shared expert; one-row windows run the
+one-token launches. If the first window launch fails, the verifier keeps
+its composed MoE. ``OMLX_QWEN35_MOE_VERIFY_WINDOW=0`` keeps it too.
+
 MLX commits a command buffer once the inputs bound to it exceed its size cap
 (50 MB by default), counting each input array whole. The stacked expert
 weights are hundreds of MB, so every launch that binds them ends a command
-buffer (~10-20 us of host CPU and a GPU gap per commit). The kernels
-therefore bind a one-expert view that shares the stacked array's buffer at
-offset 0 and index the other experts from it. The weights are resident model
-parameters, so the cap has nothing to bound here. Only scheduling changes;
+buffer (~10-20 us of host CPU and a GPU gap per commit, and the host blocks
+once too many are in flight). The kernels therefore bind a one-expert view
+that shares the stacked array's buffer at offset 0 and index the other
+experts from it. The weights are resident model parameters, so the cap has
+nothing to bound here. Only scheduling changes;
 ``OMLX_QWEN35_MOE_ROUTED_DECODE_VIEWS=0`` binds the whole arrays.
 """
 
@@ -60,7 +75,7 @@ from __future__ import annotations
 
 import logging
 import os
-from functools import cache
+from functools import cache, wraps
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -82,6 +97,10 @@ _SHARED_FOLD = os.environ.get("OMLX_QWEN35_MOE_SHARED_FOLD", "1") != "0"
 _VIEWS_ENABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTED_DECODE_VIEWS", "1") != "0"
 _DISABLED = False
 _PROVEN = False
+_VERIFY_WINDOW = os.environ.get("OMLX_QWEN35_MOE_VERIFY_WINDOW", "1") != "0"
+WINDOW_MAX_ROWS = 8
+_WINDOW_DISABLED = False
+_WINDOW_PROVEN = False
 
 
 class _Format(NamedTuple):
@@ -304,6 +323,47 @@ _DOWN_TAIL = r"""
     }
 """
 
+# Verify-window variants: row ``window_row`` of an M-row window runs the
+# one-token source verbatim on its own input, routing and output (the kernel
+# pointers are rebound in an inner scope). Threadgroup y is
+# ``block * M + window_row``, so the rows of one weight block run back to
+# back and share its fetch through the cache.
+_GATE_UP_WINDOW_HEAD = r"""
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    constexpr int ROWS = NSG * RPS;
+    const int window_row = int(threadgroup_position_in_grid.y) % M;
+    int b = int(threadgroup_position_in_grid.y) / M;
+    float result[2 * RPS];
+    const auto x_row = x + window_row * K;
+    const auto rhs_row = rhs + window_row * 10;
+    const auto y_row = y + window_row * (10 * NI + NS + 1);
+    {
+    const auto x = x_row;
+    const auto rhs = rhs_row;
+    const auto y = y_row;
+"""
+
+_DOWN_WINDOW_HEAD = r"""
+    const uint3 tid = threadgroup_position_in_grid;
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const int window_row = int(tid.y) % M;
+    const int out_row = int(tid.y) / M * RPS;
+    const int slot = int(simd_gid);
+    threadgroup T part[NPART * RPS];
+    float result[RPS];
+    const auto x_row = x + window_row * (10 * K + KS + 1);
+    const auto rhs_row = rhs + window_row * 10;
+    const auto scores_row = scores + window_row * 10;
+    const auto y_row = y + window_row * N;
+    {
+    const auto x = x_row;
+    const auto rhs = rhs_row;
+    const auto scores = scores_row;
+    const auto y = y_row;
+"""
+
 
 def _format_header(namespace: str, fmt: _Format) -> str:
     header = (
@@ -372,6 +432,46 @@ def _down_kernel(routed: _Format, shared: _Format | None):
     )
 
 
+@cache
+def _gate_up_window_kernel(routed: _Format, shared: _Format, gate: _Format):
+    """The folded gate+up/SwiGLU launch for every row of a verify window."""
+    header = (
+        _COMMON
+        + _format_header("rt", routed)
+        + _format_header("st", shared)
+        + _format_header("gt", gate)
+    )
+    return mx.fast.metal_kernel(
+        name=(
+            f"omlx_qwen35_moe_gate_up_window_{_name(routed)}"
+            f"_shared_{_name(shared)}_gate_{_name(gate)}"
+        ),
+        input_names=[
+            "x", "w", "scales", "biases", "rhs",
+            "sg_w", "sg_s", "sg_b", "su_w", "su_s", "su_b", "g_w", "g_s", "g_b",
+        ],
+        output_names=["y"],
+        header=header,
+        source=_GATE_UP_WINDOW_HEAD + _GATE_UP_SHARED + _GATE_UP_ROUTED + "    }\n",
+    )
+
+
+@cache
+def _down_window_kernel(routed: _Format, shared: _Format):
+    """The folded down/combine launch for every row of a verify window."""
+    header = _COMMON + _format_header("rd", routed) + _format_header("sd", shared)
+    tail = _DOWN_TAIL.replace("SHARED_VALUE", "part[10 * RPS + int(simd_lid)]").replace(
+        "GATE_VALUE", "x[10 * K + KS]"
+    )
+    return mx.fast.metal_kernel(
+        name=f"omlx_qwen35_moe_down_combine_window_{_name(routed)}_shared_{_name(shared)}",
+        input_names=["x", "w", "scales", "biases", "sd_w", "sd_s", "sd_b", "rhs", "scores"],
+        output_names=["y"],
+        header=header,
+        source=_DOWN_WINDOW_HEAD + _DOWN_SHARED_ROWS + tail + "    }\n",
+    )
+
+
 def _quantized_ok(layer, cls) -> bool:
     # Exactly the class whose call is a bare quantized_matmul / gather_qmm;
     # subclasses and repacked layers may compute differently.
@@ -429,6 +529,8 @@ class _Plan(NamedTuple):
     shared_gate_up_operands: tuple = ()  # gate_proj, up_proj, gate (fold)
     shared_down_operands: tuple = ()  # down_proj (fold)
     router_logits: object = None  # qwen35_moe_router.router_gemv launcher
+    window_gate_up_kernel: object = None  # verify-window launches (fold)
+    window_down_kernel: object = None
 
 
 def _shared_formats(block, hidden: int):
@@ -555,6 +657,8 @@ def _build_plan(block) -> _Plan | None:
         down_threadgroup=(32, TOP_K + 1, 1),
         shared_gate_up_operands=shared_gate_up,
         shared_down_operands=shared_down,
+        window_gate_up_kernel=_gate_up_window_kernel(gu_fmt, sgu_fmt, g_fmt),
+        window_down_kernel=_down_window_kernel(d_fmt, sd_fmt),
     )
 
 
@@ -599,6 +703,103 @@ def routed_decode(plan: _Plan, x, indices, scores, shared=None, gate=None):
         output_shapes=[x.shape],
         output_dtypes=[mx.bfloat16],
     )[0]
+
+
+def routed_window(plan: _Plan, x, indices, scores):
+    """``routed_decode`` for each row of ``x`` ([M, hidden], 2..M rows,
+    ``indices`` / ``scores`` [M, TOP_K]) in the same two launches: row r
+    runs the one-token arithmetic on its own routing. Needs a folded plan."""
+    rows = x.shape[0]
+    h = plan.window_gate_up_kernel(
+        inputs=[x, *plan.gate_up_operands, indices, *plan.shared_gate_up_operands],
+        template=plan.gate_up_template + [("M", rows)],
+        grid=(32, plan.gate_up_grid[1] * rows, 1),
+        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
+        output_shapes=[(rows, *plan.gate_up_output)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    return plan.window_down_kernel(
+        inputs=[h, *plan.down_operands, *plan.shared_down_operands, indices, scores],
+        template=plan.down_template + [("M", rows)],
+        grid=(32, plan.down_grid[1] * rows, 1),
+        threadgroup=plan.down_threadgroup,
+        output_shapes=[(rows, plan.hidden)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
+def routed_verify_window(block, x):
+    """The block's output for a row-exact verify window ``x`` ([B, L, hidden],
+    1..``WINDOW_MAX_ROWS`` rows), each row bit-identical to the fused
+    one-token call on that row, or None outside the fused layout.
+
+    Router gemv, softmax + top-k, gate+up and down/combine each run once for
+    the whole window."""
+    global _WINDOW_DISABLED, _WINDOW_PROVEN
+    if (
+        not _VERIFY_WINDOW
+        or _WINDOW_DISABLED
+        or _DISABLED
+        or x.ndim != 3
+        or x.dtype != mx.bfloat16
+        or block.top_k != TOP_K
+    ):
+        return None
+    from .qwen35_moe_router import fused_router_topk, router_eligible, softmax_topk_rows
+
+    hidden = x.shape[-1]
+    rows = x.size // hidden
+    if not 1 <= rows <= WINDOW_MAX_ROWS or not router_eligible(x, block.num_experts):
+        return None
+    plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
+    if plan is None or plan.hidden != hidden or not plan.fold or plan.router_logits is None:
+        return None
+    x = x.reshape(rows, hidden)
+    logits = plan.router_logits(x)
+    routing = softmax_topk_rows(logits, TOP_K)
+    if routing is None:
+        routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), TOP_K)
+    inds, scores = routing
+    try:
+        if rows == 1:
+            y = routed_decode(plan, x, inds, scores)
+        else:
+            y = routed_window(plan, x, inds, scores)
+        if not _WINDOW_PROVEN:
+            mx.eval(y)
+            _WINDOW_PROVEN = True
+            logger.info("Qwen MoE fused verify-window experts engaged")
+    except Exception:
+        _WINDOW_DISABLED = True
+        logger.warning("fused verify-window experts failed; verifier fallback", exc_info=True)
+        return None
+    return y
+
+
+def _ensure_verify_window_patch(cls) -> None:
+    """Serve row-exact verify MoE blocks through ``routed_verify_window``.
+
+    Wraps the mlx-vlm verifier's ``_feed_forward`` (the router patch's verify
+    entry) for ``cls`` blocks while row-exact verify is armed; other verify
+    modes, blocks and shapes keep the wrapped body."""
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    from .qwen35_verify_qmm import is_row_exact_armed
+
+    original = Qwen3_5BatchInvariantForward._feed_forward
+    if getattr(original, "_omlx_routed_verify_window", False):
+        return
+
+    @wraps(original)
+    def verify_window(self, feed_forward, x):
+        if is_row_exact_armed() and isinstance(feed_forward, cls):
+            y = routed_verify_window(feed_forward, x)
+            if y is not None:
+                return y.reshape(x.shape)
+        return original(self, feed_forward, x)
+
+    verify_window._omlx_routed_verify_window = True
+    Qwen3_5BatchInvariantForward._feed_forward = verify_window
 
 
 def apply_qwen35_moe_routed_decode_patch() -> bool:
@@ -664,5 +865,7 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     patched_call._omlx_routed_decode_original = orig_call
     cls.__call__ = patched_call
     cls._omlx_routed_decode = True
+    if _VERIFY_WINDOW:
+        _ensure_verify_window_patch(cls)
     logger.info("Qwen MoE fused routed-expert decode patch applied")
     return True
