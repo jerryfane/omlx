@@ -1507,10 +1507,10 @@ def apply_verify_qmm_patch() -> bool:
 
     orig_call = cls.__call__
 
+    from .row_exact_qmv import quantized_linear as row_exact_linear
+
     def patched_call(self, x):
         if is_row_exact_armed() and x.ndim >= 2 and x.size // x.shape[-1] > 1:
-            from .row_exact_qmv import quantized_linear as row_exact_linear
-
             return row_exact_linear(self, x)
         if (
             not _is_armed()
