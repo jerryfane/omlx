@@ -32,6 +32,7 @@ window and per-step recurrent states the speculative cache records.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sys
@@ -1155,26 +1156,14 @@ def _qwen4_verify_step_kernel(states: bool):
     return kernel
 
 
-def qwen4_verify_step_fused(
-    proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, hk, hv, dk, dv,
-):
-    """``S = proj.shape[1]`` decode steps from (conv_state, state) in one launch
-    (dk = dv = 128, B = 1, a 4-tap convolution).
-
-    Row t of ``proj`` is the stacked in-projection [qkv | z | b | a] of step t.
-    Returns (next conv state, rollback window [1, 3 + S, C] = [conv_state; qkv
-    rows], the states after steps 0..S-2 [1, S-1, hv, dv, dk] or None at S = 1,
-    the state after step S-1, gated output [1, S, hv*dv]); step t's values are
-    bit-identical to the (t+1)-th of S chained ``qwen4_decode_step_fused`` calls.
-    """
-    steps = int(proj.shape[1])
-    c_dim = int(conv_state.shape[-1])
+@functools.cache
+def _qwen4_verify_step_launch(steps, dtype, state_dtype, c_dim, hk, hv, dk, dv):
+    """Launch parameters of ``qwen4_verify_step_fused`` for one block shape."""
+    history = steps > 1
     rows = dv // 8
-    states = steps > 1
-    outputs = _qwen4_verify_step_kernel(states)(
-        inputs=[proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps],
-        template=[
-            ("T", proj.dtype),
+    return _qwen4_verify_step_kernel(history), {
+        "template": [
+            ("T", dtype),
             ("HK", hk),
             ("HV", hv),
             ("DK", dk),
@@ -1182,16 +1171,38 @@ def qwen4_verify_step_fused(
             ("C", c_dim),
             ("S", steps),
         ],
-        grid=(32, rows, hv),
-        threadgroup=(32, rows, 1),
-        output_shapes=[conv_state.shape, (1, 3 + steps, c_dim), state.shape]
-        + ([(1, steps - 1, hv, dv, dk)] if states else [])
+        "grid": (32, rows, hv),
+        "threadgroup": (32, rows, 1),
+        "output_shapes": [(1, 3, c_dim), (1, 3 + steps, c_dim), (1, hv, dv, dk)]
+        + ([(1, steps - 1, hv, dv, dk)] if history else [])
         + [(1, steps, hv * dv)],
-        output_dtypes=[proj.dtype, proj.dtype, state.dtype]
-        + ([state.dtype] if states else [])
-        + [proj.dtype],
+        "output_dtypes": [dtype, dtype, state_dtype]
+        + ([state_dtype] if history else [])
+        + [dtype],
+    }
+
+
+def qwen4_verify_step_fused(
+    proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, hk, hv, dk, dv,
+):
+    """``S = proj.shape[1]`` decode steps from (conv_state, state) in one launch
+    (B = 1, dk = dv = 128, a 4-tap convolution: conv_state [1, 3, C]).
+
+    Row t of ``proj`` is the stacked in-projection [qkv | z | b | a] of step t.
+    Returns (next conv state, rollback window [1, 3 + S, C] = [conv_state; qkv
+    rows], the states after steps 0..S-2 [1, S-1, hv, dv, dk] or None at S = 1,
+    the state after step S-1, gated output [1, S, hv*dv]); step t's values are
+    bit-identical to the (t+1)-th of S chained ``qwen4_decode_step_fused`` calls.
+    """
+    steps = proj.shape[1]
+    kernel, launch = _qwen4_verify_step_launch(
+        steps, proj.dtype, state.dtype, conv_state.shape[-1], hk, hv, dk, dv
     )
-    if states:
+    outputs = kernel(
+        inputs=[proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps],
+        **launch,
+    )
+    if steps > 1:
         conv_out, window, state_out, history, out = outputs
         return conv_out, window, history, state_out, out
     conv_out, window, state_out, out = outputs
@@ -1885,6 +1896,34 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 and sites[1] is not None
                 and getattr(type(layer), "_normalize_qk", None) is sites[1]
             )
+        # Qwen4 B1 rows: the fused verify reproduces the per-op path below bit
+        # for bit. Its projections run one-row qmv_fast arithmetic per row, as
+        # the verifier's do at one row and in the armed row-exact mode. The
+        # plan pins the layer geometry and weights, the state gate the inputs
+        # and both cache states.
+        if (
+            l2_norm
+            and _QWEN4_VERIFY_FUSED
+            and mask is None
+            and cache is not None
+            and cache.is_speculating
+            and cache.lengths is None
+            and 1 <= length <= 9
+            and (length == 1 or is_row_exact_armed())
+            and _qwen4_verify_state_eligible(inputs, cache)
+        ):
+            plan = _qwen4_verify_plan(layer)
+            if plan is not None:
+                result = _qwen4_verify(plan, inputs, cache)
+                if hasattr(cache, "advance"):
+                    cache.advance(length)
+                    q35._qwen3_5_advance_left_padding_info(cache, length)
+                    q35._qwen3_5_advance_lengths_info(cache, length)
+                global _QWEN4_VERIFY_ENGAGED_LOGGED
+                if not _QWEN4_VERIFY_ENGAGED_LOGGED:
+                    _QWEN4_VERIFY_ENGAGED_LOGGED = True
+                    logger.info("[gdn-prework] Qwen4 fused verify engaged (S=%d)", length)
+                return result
         # Qwen4 one-row MTP steps take the fused prework too, so their q/k/v
         # match the fused B1/T1 decode kernel (same L2 arithmetic).
         min_length = 1 if l2_norm else 2
@@ -1943,27 +1982,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                     l2_norm,
                 )
             return original_verify(verifier, layer, inputs, mask, cache)
-        # Qwen4 B1 rows: the fused verify reproduces the per-op path below bit
-        # for bit. Its projections run one-row qmv_fast arithmetic per row, as
-        # the verifier's do at one row and in the armed row-exact mode.
-        if (
-            l2_norm
-            and _QWEN4_VERIFY_FUSED
-            and (length == 1 or is_row_exact_armed())
-            and _qwen4_verify_state_eligible(inputs, cache)
-        ):
-            plan = _qwen4_verify_plan(layer)
-            if plan is not None:
-                result = _qwen4_verify(plan, inputs, cache)
-                if hasattr(cache, "advance"):
-                    cache.advance(length)
-                    q35._qwen3_5_advance_left_padding_info(cache, length)
-                    q35._qwen3_5_advance_lengths_info(cache, length)
-                global _QWEN4_VERIFY_ENGAGED_LOGGED
-                if not _QWEN4_VERIFY_ENGAGED_LOGGED:
-                    _QWEN4_VERIFY_ENGAGED_LOGGED = True
-                    logger.info("[gdn-prework] Qwen4 fused verify engaged (S=%d)", length)
-                return result
         mixed_qkv, z, b, a = verifier._linears(
             (layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a),
             inputs,

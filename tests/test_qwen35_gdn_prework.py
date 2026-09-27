@@ -1279,7 +1279,7 @@ def qwen4_verify(monkeypatch):
 
 def _verify_block(module, inputs, conv_state, recurrent_state, *, row_exact=True):
     from mlx_vlm.models.cache import ArraysCache
-    from mlx_vlm.models.qwen4_exp.language import _VERIFIER
+    from mlx_vlm.models.qwen4_exp import language as q4
 
     from omlx.patches import qwen35_verify_qmm
 
@@ -1288,7 +1288,10 @@ def _verify_block(module, inputs, conv_state, recurrent_state, *, row_exact=True
     transaction = start_speculative_cache([cache], inputs.shape[1])
     qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=row_exact)
     try:
-        out = _VERIFIER._gated_delta(module, inputs, None, cache)
+        # The compat vendor's verifier, or upstream mlx-vlm's when a test
+        # earlier in the session imported that first (as the patch resolves).
+        verifier = (getattr(q4, "_Qwen4Verifier", None) or q4.Qwen4ExpBatchInvariantForward)()
+        out = verifier._gated_delta(module, inputs, None, cache)
     finally:
         qwen35_verify_qmm.set_verify_qmm_armed(False)
     mx.eval(out, cache.state)
