@@ -1062,9 +1062,14 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
         return size + self.indexer_nbytes
 
 
-# Dispatch each decoder layer's graph to the GPU as soon as it is built (decode and
-# verify rows only) so the GPU executes layer i while the host builds layer i+1.
-# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0.
+# Dispatch decoder layers' graphs to the GPU as they are built (decode and verify
+# rows only) so the GPU executes earlier layers while the host builds later ones.
+# The first _EAGER_DISPATCH_WARMUP layers commit one by one (the GPU starts as
+# early as before and its queue fills), then every _EAGER_DISPATCH_EVERY-th
+# layer: each commit costs ~20 us of host CPU, and the queued GPU work covers
+# the host's build of the next group.
+# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0;
+# OMLX_QWEN4_EAGER_DISPATCH_EVERY=1 commits every layer.
 _EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower() not in {
     "0",
     "false",
@@ -1072,6 +1077,19 @@ _EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower
     "off",
 }
 _EAGER_DISPATCH_MAX_ROWS = 64
+_EAGER_DISPATCH_EVERY_DEFAULT = 3
+
+
+def _eager_dispatch_every() -> int:
+    raw = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH_EVERY", "").strip()
+    try:
+        return max(1, int(raw)) if raw else _EAGER_DISPATCH_EVERY_DEFAULT
+    except ValueError:
+        return _EAGER_DISPATCH_EVERY_DEFAULT
+
+
+_EAGER_DISPATCH_EVERY = _eager_dispatch_every()
+_EAGER_DISPATCH_WARMUP = 6
 # Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
 _GATHERED_VERIFY_DISABLED = os.environ.get(
     "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
@@ -3352,6 +3370,10 @@ class Qwen4ExpModel(nn.Module):
                 hidden_states, write = hidden_states[0], hidden_states[1:]
             if (
                 _EAGER_DISPATCH
+                and (
+                    index < _EAGER_DISPATCH_WARMUP
+                    or index % _EAGER_DISPATCH_EVERY == 0
+                )
                 and hidden_states.shape[0] * hidden_states.shape[1]
                 <= _EAGER_DISPATCH_MAX_ROWS
             ):
