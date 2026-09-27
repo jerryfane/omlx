@@ -179,10 +179,12 @@ def _decode_and_verify(model, head, ids):
     for rows in (1, 2, 3, 4):
         outputs.append(model(ids(1, rows), cache=cache).logits)
     for rows in (1, 2, 3, 4):
-        # Lightning MTP verify: target-verify rows plus the pre-mixer residual.
+        # Lightning MTP verify: target-verify rows plus the pre-mixer residual
+        # (a one-row window is the decode step itself, with no transaction).
         out = model(ids(1, rows), cache=cache, return_hidden=True)
         hidden = out.hidden_states[0]
-        out.gdn_states.commit([rows])
+        if out.gdn_states is not None:
+            out.gdn_states.commit([rows])
         mixed, residual = head(hidden, ids(1, rows), model.model.embed_tokens)
         outputs += [out.logits, hidden, mixed, residual]
     sink = []

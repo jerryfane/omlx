@@ -10,6 +10,7 @@ import time
 import weakref
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock, RLock
@@ -1102,6 +1103,16 @@ _GATHERED_VERIFY_DISABLED = os.environ.get(
 _MASKED_VERIFY_DISABLED = os.environ.get(
     "OMLX_QWEN4_QSA_MASKED_VERIFY", "1"
 ).strip().lower() in {"0", "false", "no", "off"}
+# Lightning MTP one-row windows (the activation step, depth-0 cycles) have no
+# draft to reject, so they run the serial decode step itself rather than a
+# verify forward (OMLX_QWEN4_MTP_ONE_ROW_DECODE=0 keeps the verify forward).
+_ONE_ROW_MTP_DECODE_DISABLED = os.environ.get(
+    "OMLX_QWEN4_MTP_ONE_ROW_DECODE", "1"
+).strip().lower() in {"0", "false", "no", "off"}
+# Set while such a step runs: a verify forward never feeds prompt priming.
+_MTP_ONE_ROW_STEP: ContextVar[bool] = ContextVar(
+    "omlx_qwen4_mtp_one_row_step", default=False
+)
 # Attention/indexer norms keep their FP32 1 + weight scale between calls
 # (OMLX_QWEN4_NORM_SCALE_CACHE=0 rebuilds it every call; same values).
 _NORM_SCALE_CACHE_DISABLED = os.environ.get(
@@ -3638,7 +3649,7 @@ class Qwen4ExpModel(nn.Module):
                 hidden_states, target_verify=target_verify, write=write
             )
 
-        if inputs_embeds is None and gdn_sink is None:
+        if inputs_embeds is None and gdn_sink is None and not _MTP_ONE_ROW_STEP.get():
             host_ref = getattr(self, "_omlx_mtp_prime_host", None)
             host = host_ref() if host_ref is not None else None
             if host is not None:
@@ -3837,11 +3848,20 @@ class LanguageModel(Qwen3_5LanguageModel):
         mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
+        one_row_step = (
+            mtp_capture
+            and not _ONE_ROW_MTP_DECODE_DISABLED
+            and inputs_embeds is None
+            and tuple(inputs.shape) == (1, 1)
+            and cache is not None
+            and not any(getattr(c, "_speculation", None) is not None for c in cache)
+        )
         transaction = (
             start_speculative_cache(cache or [], inputs.shape[1])
-            if mtp_capture
+            if mtp_capture and not one_row_step
             else None
         )
+        step = _MTP_ONE_ROW_STEP.set(True) if one_row_step else None
         try:
             output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
             if mtp_capture and output.hidden_states:
@@ -3852,6 +3872,9 @@ class LanguageModel(Qwen3_5LanguageModel):
             if transaction is not None:
                 transaction.abort()
             raise
+        finally:
+            if step is not None:
+                _MTP_ONE_ROW_STEP.reset(step)
 
     def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
         """Start gathering the next prefill chunk's PLE rows while ``current_ids`` runs."""

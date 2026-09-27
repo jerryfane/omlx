@@ -1054,6 +1054,56 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
     assert qsa_cache.index_position_ids.shape[-1] == 4
 
 
+def _cache_arrays(cache):
+    arrays = []
+    for entry in cache:
+        state = entry.state if hasattr(entry, "state") else entry
+        items = state if isinstance(state, (list, tuple)) else [state]
+        arrays.extend(item for item in items if isinstance(item, mx.array))
+    return arrays
+
+
+def test_qwen4_mtp_one_row_step_is_the_serial_decode_step():
+    """A Lightning MTP window of one row (activation, depth-0 cycle) has no draft
+    to roll back: it must be the serial decode step, cache and all, and leave
+    the cache ready for the next verify window."""
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    step_cache = model.make_cache()
+    serial_cache = model.make_cache()
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    model(prefix, cache=step_cache)
+    model(prefix, cache=serial_cache)
+
+    stepped = model(mx.array([[5]], dtype=mx.int32), cache=step_cache, return_hidden=True)
+    serial = model(mx.array([[5]], dtype=mx.int32), cache=serial_cache)
+    mx.eval(stepped.logits, stepped.hidden_states, serial.logits)
+
+    assert stepped.gdn_states is None
+    assert stepped.hidden_states[0].shape == (1, 1, 64)
+    assert mx.array_equal(stepped.logits, serial.logits).item()
+    stepped_arrays = _cache_arrays(step_cache)
+    serial_arrays = _cache_arrays(serial_cache)
+    assert len(stepped_arrays) == len(serial_arrays)
+    for got, want in zip(stepped_arrays, serial_arrays):
+        assert mx.array_equal(got, want).item()
+
+    # The next window verifies on top of the step and rolls back as usual.
+    verified = model(mx.array([[6, 7]], dtype=mx.int32), cache=step_cache, return_hidden=True)
+    assert verified.gdn_states.active
+    model.rollback_speculative_cache(
+        step_cache, verified.gdn_states, accepted=0, block_size=2
+    )
+    first = model(mx.array([[6]], dtype=mx.int32), cache=serial_cache)
+    assert mx.array_equal(
+        mx.argmax(verified.logits[:, :1], axis=-1), mx.argmax(first.logits, axis=-1)
+    ).item()
+    assert step_cache[1].offset == serial_cache[1].offset == 5
+
+
+
 def _assert_ple_state_matches(actual_cache, expected_cache):
     mx.eval(
         actual_cache[2],
