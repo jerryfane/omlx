@@ -45,6 +45,8 @@ import struct
 
 import mlx.core as mx
 
+from .qwen35_verify_qmm import is_row_exact_armed
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -853,7 +855,12 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
                 try:
                     q_len = queries.shape[-2]
                     wide_from = min(limit + 1, _WIDE_MIN_ROWS)
-                    if (
+                    if is_row_exact_armed():
+                        # MLX's vector kernel scores each query row exactly
+                        # like a one-row decode call; the tile kernels below
+                        # round probabilities differently.
+                        out = _chunked_causal_sdpa(queries, keys, values, scale, limit)
+                    elif (
                         q_len <= _WIDE_MAX_ROWS
                         and keys.shape[-2] >= _GQA_MIN_KEYS
                         and queries.shape[1] // keys.shape[1] <= _GQA_MAX_GROUP

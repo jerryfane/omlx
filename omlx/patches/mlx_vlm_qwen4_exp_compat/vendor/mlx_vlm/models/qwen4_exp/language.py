@@ -107,6 +107,13 @@ def _gathered_min_query_tokens() -> int:
     return 16
 
 
+def _row_exact_verify_armed() -> bool:
+    """Inside an armed MTP verify whose rows must equal serial decode steps."""
+    from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
+
+    return is_row_exact_armed()
+
+
 def _split_text_mrope_positions(
     position_ids: Optional[mx.array],
     batch: int,
@@ -1687,6 +1694,150 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         output = output.reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))
 
+    def _row_exact_gathered_verify_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Row-exact Lightning MTP verify windows reaching past the QSA budget
+        with text positions: the arms whose rows a serial decode step would
+        attend through gathered QSA, or densely just below the crossover."""
+
+        if not (target_verify and _row_exact_verify_armed()):
+            return False
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            x.ndim == 3
+            and x.shape[0] == 1
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+            and _rank_two_text_position_ids(position_ids, x.shape[1])
+        ):
+            return False
+        if cache.offset:
+            if cache.index_keys is None or cache.index_position_ids is None:
+                return False
+            if (
+                cache.index_keys.shape[1] != cache.offset
+                or cache.index_position_ids.shape[-1] != cache.offset
+            ):
+                return False
+        return cache.offset + x.shape[1] > self.indexer.token_budget
+
+    def _row_exact_gathered_verify(
+        self,
+        x: mx.array,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Attend every verify row exactly as its serial decode step would.
+
+        Projections, norms and RoPE are per-row arithmetic already. Each row
+        then appends its own indexer key, pools blocks on the serial schedule
+        and runs the serial arm for its prefix: gathered QSA decode past the
+        block budget, otherwise plain one-row SDPA over the whole prefix
+        (what the official path computes when the indexer selects every block).
+        """
+
+        from ..qwen3_5 import language as q35_language
+
+        batch, length, _ = x.shape
+        q_proj_output, new_keys, new_values = _target_verify_linears(
+            (self.q_proj, self.k_proj, self.v_proj), x
+        )
+        queries, gate = mx.split(
+            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
+            2,
+            axis=-1,
+        )
+        gate = gate.reshape(batch, length, -1)
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        new_keys = self.k_norm(
+            new_keys.reshape(batch, length, self.num_key_value_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        new_values = new_values.reshape(
+            batch, length, self.num_key_value_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+
+        past_len = cache.offset
+        text_position_ids, rotary_position_ids = _split_text_mrope_positions(
+            position_ids, batch, length, past_len
+        )
+        queries, new_keys = self.rotary_emb.apply_rotary(
+            queries,
+            new_keys,
+            rotary_position_ids,
+            unsqueeze_dim=1,
+        )
+        keys, values = cache.update_and_fetch(new_keys, new_values)
+
+        projected = _target_verify_linear(self.indexer.index_qk_proj, x).reshape(
+            batch,
+            length,
+            self.indexer.n_heads + self.indexer.kv_heads,
+            self.indexer.head_dim,
+        )
+        index_queries = self.indexer.q_layernorm(
+            projected[:, :, : self.indexer.n_heads]
+        ).transpose(0, 2, 1, 3)
+        raw_index_keys = projected[:, :, self.indexer.n_heads :].squeeze(2)
+        index_queries = self.indexer._apply_rope(
+            index_queries,
+            text_position_ids,
+        ).transpose(0, 2, 1, 3)
+
+        outputs = []
+        for row in range(length):
+            key_tokens = past_len + row + 1
+            # A decode step's query is a contiguous [1, H, 1, D] array; the
+            # native decode SDPA accepts only that layout.
+            row_queries = mx.contiguous(queries[:, :, row : row + 1])
+            cache.update_indexer(
+                raw_index_keys[:, row : row + 1],
+                text_position_ids[..., row : row + 1],
+            )
+            row_keys = keys[..., :key_tokens, :]
+            row_values = values[..., :key_tokens, :]
+            if key_tokens // self.indexer.compress_ratio > self.indexer.block_topk:
+                pooled_index_keys = cache.pooled_indexer_keys(
+                    self.indexer.compress_ratio,
+                    self.indexer.k_layernorm,
+                    self.indexer._apply_rope,
+                    cache_tag=self.indexer,
+                )
+                output = contiguous_causal_gathered_qsa_decode(
+                    row_queries,
+                    row_keys,
+                    row_values,
+                    index_queries[:, row : row + 1],
+                    pooled_index_keys,
+                    num_query_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    head_dim=self.head_dim,
+                    indexer_head_dim=self.indexer.head_dim,
+                    compress_ratio=self.indexer.compress_ratio,
+                    token_budget=self.indexer.token_budget,
+                )
+            else:
+                output = q35_language.scaled_dot_product_attention(
+                    row_queries,
+                    row_keys,
+                    row_values,
+                    cache=cache,
+                    scale=self.scale,
+                    mask=None,
+                ).transpose(0, 2, 1, 3)
+            outputs.append(output)
+        output = outputs[0] if length == 1 else mx.concatenate(outputs, axis=1)
+        output = output.reshape(batch, length, -1)
+        return _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
+
     def __call__(
         self,
         x: mx.array,
@@ -1716,6 +1867,18 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ):
             cache._omlx_last_prefill_gathered = True
             return self._gathered_text_prefill(x, cache, position_ids)
+
+        if self._row_exact_gathered_verify_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            if x.shape[1] > 1:
+                cache._omlx_last_prefill_gathered = True
+            return self._row_exact_gathered_verify(x, cache, position_ids)
 
         if self._gathered_text_verify_eligible(
             x,
@@ -3318,6 +3481,9 @@ class Qwen4ExpMTPModule(nn.Module):
 class LanguageModel(Qwen3_5LanguageModel):
     _omlx_mtp_multi_request = True
     _omlx_mtp_batch_rollback = True
+    # Lightning MTP verify rows reproduce one-row decode arithmetic, so
+    # greedy MTP output equals MTP-off output (batch_generator._row_exact_verify).
+    _omlx_mtp_row_exact_verify = True
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
