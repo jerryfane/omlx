@@ -38,6 +38,7 @@ from .config import ModelConfig, TextConfig
 from .qsa_fast import (
     contiguous_causal_gathered_qsa,
     contiguous_causal_gathered_qsa_decode,
+    decode_block_selection_mask,
     pool_completed_index_keys,
 )
 from . import hc_fused
@@ -1094,22 +1095,52 @@ _EAGER_DISPATCH_WARMUP = 6
 _GATHERED_VERIFY_DISABLED = os.environ.get(
     "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
 ).strip().lower() in {"0", "false", "no", "off"}
+# Attention/indexer norms keep their FP32 1 + weight scale between calls
+# (OMLX_QWEN4_NORM_SCALE_CACHE=0 rebuilds it every call; same values).
+_NORM_SCALE_CACHE_DISABLED = os.environ.get(
+    "OMLX_QWEN4_NORM_SCALE_CACHE", "1"
+).strip().lower() in {"0", "false", "no", "off"}
 
 
 class Qwen4ExpRMSNorm(nn.Module):
-    """Qwen4 RMSNorm, whose checkpoint weights are centered at zero."""
+    """Qwen4 RMSNorm, whose checkpoint weights are centered at zero.
 
-    def __init__(self, dim: int, group_size: int | None = None, eps: float = 1e-6):
+    ``cache_scale`` keeps the FP32 ``1 + weight`` built from the current weight
+    array instead of two launches per call. Only for norms that ``mx.compile``
+    never traces: a scale cached inside a trace would outlive it.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        group_size: int | None = None,
+        eps: float = 1e-6,
+        cache_scale: bool = False,
+    ):
         super().__init__()
         self.eps = eps
         self.group_size = group_size
         if group_size is not None and dim % group_size:
             raise ValueError(f"{dim=} must be divisible by {group_size=}")
         self.weight = mx.zeros(dim)
+        # Plain attributes, not parameters: (weight the scale was built from, scale).
+        self._cache_scale = cache_scale and not _NORM_SCALE_CACHE_DISABLED
+        self._cached_scale = None
+
+    def _scale(self) -> mx.array:
+        weight = self.weight
+        if not self._cache_scale:
+            return 1.0 + weight.astype(mx.float32)
+        cached = self._cached_scale
+        if cached is None or cached[0] is not weight:
+            # A reloaded weight is a new array; the old scale is dropped.
+            cached = (weight, 1.0 + weight.astype(mx.float32))
+            object.__setattr__(self, "_cached_scale", cached)
+        return cached[1]
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
-        scale = 1.0 + self.weight.astype(mx.float32)
+        scale = self._scale()
         if self.group_size is None:
             return mx.fast.rms_norm(x, scale, self.eps).astype(dtype)
         # rms_norm takes a 1-D weight, so a grouped norm cannot hand it the
@@ -1182,8 +1213,12 @@ class Qwen4ExpQSAIndexer(nn.Module):
             (self.n_heads + self.kv_heads) * self.head_dim,
             bias=False,
         )
-        self.q_layernorm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_layernorm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_layernorm = Qwen4ExpRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, cache_scale=True
+        )
+        self.k_layernorm = Qwen4ExpRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, cache_scale=True
+        )
 
     @staticmethod
     def _default_position_ids(batch: int, start: int, length: int):
@@ -1324,6 +1359,20 @@ class Qwen4ExpQSAIndexer(nn.Module):
         scores = query.astype(mx.float32) @ pooled_keys.astype(mx.float32).transpose(
             0, 1, 3, 2
         )
+        if batch == 1 and seq_len == 1 and past_len == key_len - 1:
+            # Aligned one-row decode: every complete block is causal and the
+            # sparse arm is active, so the mask is the winning blocks plus the
+            # incomplete tail -- one launch for the ops below.
+            decode_mask = decode_block_selection_mask(
+                scores,
+                head_dim=self.head_dim,
+                key_tokens=key_len,
+                compress_ratio=self.compress_ratio,
+                block_topk=self.block_topk,
+            )
+            if decode_mask is not None:
+                return decode_mask
+
         scores = mx.sum(mx.maximum(scores, 0), axis=1)
         scores = scores / math.sqrt(self.head_dim)
 
@@ -1376,8 +1425,12 @@ class Qwen4ExpQSAIndexer(nn.Module):
 class Qwen4ExpAttention(Qwen3_5Attention):
     def __init__(self, config: TextConfig):
         super().__init__(config)
-        self.q_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Qwen4ExpRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, cache_scale=True
+        )
+        self.k_norm = Qwen4ExpRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, cache_scale=True
+        )
         self.indexer = Qwen4ExpQSAIndexer(config, self.rotary_emb)
 
     @staticmethod
