@@ -93,3 +93,53 @@ def test_row_exact_arming_routes_multi_row_quantized_linear():
     routed = linear(x)
     qwen35_verify_qmm.set_verify_qmm_armed(False)
     assert _bit_equal(routed, reference)
+
+
+def _quantized(k, n, bits, group_size, dtype, seed):
+    mx.random.seed(seed)
+    weight = (mx.random.normal((n, k)) * 0.05).astype(dtype)
+    return mx.quantize(weight, group_size=group_size, bits=bits)
+
+
+# FP32 rows expose the unrounded accumulations that a BF16 output hides.
+@pytest.mark.parametrize(
+    "k, n, bits, group_size",
+    [
+        (2560, 16480, 6, 64),  # DeltaNet stacked qkv/z/b/a in-projection
+        (6144, 2560, 5, 128),  # DeltaNet out-projection
+        (2560, 1024, 4, 64),
+        (1024, 520, 8, 32),
+    ],
+)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("rps", [1, 2, 4])
+def test_one_row_qmv_equals_quantized_matmul(k, n, bits, group_size, dtype, rps):
+    for seed in (5, 23):
+        weight, scales, biases = _quantized(k, n, bits, group_size, dtype, seed + rps)
+        x = mx.random.normal((1, 1, k)).astype(dtype)
+        launch = row_exact_qmv.one_row_qmv(
+            weight, scales, biases, bits, group_size, "affine", dtype, rps
+        )
+        expected = mx.quantized_matmul(
+            x, weight, scales, biases, transpose=True, group_size=group_size, bits=bits
+        )
+        observed = launch(x)
+        assert observed.shape == expected.shape and observed.dtype == dtype
+        view = mx.uint32 if dtype == mx.float32 else mx.uint16
+        assert mx.array_equal(observed.view(view), expected.view(view)).item()
+
+
+@pytest.mark.parametrize(
+    "k, n, rps",
+    [
+        (640, 2560, 1),  # stock runs qmv, not qmv_fast (K % 512)
+        (2560, 12, 1),  # stock runs qmv (N % 8)
+        (2560, 40, 8),  # the 16-column tile does not divide N
+    ],
+)
+def test_one_row_qmv_declines_shapes_stock_does_not_run_fast(k, n, rps):
+    weight, scales, biases = _quantized(k, n, 8, 64, mx.bfloat16, 1)
+    assert (
+        row_exact_qmv.one_row_qmv(weight, scales, biases, 8, 64, "affine", mx.bfloat16, rps)
+        is None
+    )

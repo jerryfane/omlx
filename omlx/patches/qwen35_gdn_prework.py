@@ -23,7 +23,8 @@ This kernel also runs automatically for compatible FP16/BF16 B1/T1 decode
 through Qwen3_5GatedDeltaNet on Metal. Gates,
 recurrence, final norm and projections remain unchanged. Other Qwen3.5
 decode shapes and prefill keep the stock path. Qwen4 has its separate
-BF16 decode prework and norm-gate kernels below.
+BF16 decode prework and norm-gate kernels below, and its planned decode runs
+them with the recurrence as one launch between the two projections.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ import mlx.nn as nn
 
 from . import qwen35_gdn_verify_fused
 from .module_cache import cached_per_module
+from .row_exact_qmv import one_row_qmv
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ _ENGAGED_LOGGED = False
 _KERNEL = None
 _QWEN4_DECODE_KERNEL = None
 _QWEN4_NORM_GATE_KERNEL = None
+_QWEN4_DECODE_STEP_KERNEL = None
 _QWEN4_DECODE_ENGAGED_LOGGED = False
 _QWEN35_DECODE_ENGAGED_LOGGED = False
 _QWEN4_PREFILL_KERNELS = None
@@ -54,6 +57,11 @@ _QWEN4_PREFILL_MIN_ROWS = 64
 # The B1/T1 decode resolves its static eligibility and operands once per layer
 # (rebuilt when a weight or child module is replaced); =0 re-derives them per call.
 _QWEN4_DECODE_PLAN_ENABLED = os.environ.get("OMLX_QWEN4_GDN_DECODE_PLAN", "1") != "0"
+# On the planned decode: the prework, recurrence and norm-gate as one launch
+# (=0 keeps the three launches), and the in-/out-projections as one-row
+# qmv_fast with a narrower column tile (=0 keeps stock quantized_matmul).
+_QWEN4_DECODE_STEP_FUSED = os.environ.get("OMLX_QWEN4_GDN_DECODE_STEP_FUSED", "1") != "0"
+_QWEN4_DECODE_QMV = os.environ.get("OMLX_QWEN4_GDN_DECODE_QMV", "1") != "0"
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -312,6 +320,191 @@ _QWEN4_NORM_GATE_SOURCE = """
         float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(zv)));
         float sig = zv < 0.0f ? sy : 1.0f - sy;
         out[base + i] = T(float(normed) * sig);
+    }
+"""
+
+
+# The whole B1/T1 GDN step between the projections in one launch, one
+# threadgroup per value head (16 simdgroups, the head's 128 value rows):
+#   1. simdgroups 0/1/2 run the decode prework above for this head's q, k
+#      (key head hv / (HV / HK)) and v channels, lane for lane (same channels
+#      per lane, same L2 butterfly), one lane of simdgroup 3 its g and beta;
+#      the results go to threadgroup memory in the prework's output types.
+#      The next conv state is written once per channel: q/k channels by the
+#      first value head of their key head, v channels by their own head.
+#   2. mlx-lm's ``gated_delta_step_packed_btree`` recurrence (T=1; four lanes
+#      and 32 FP32 state values per value row, the same partial sums and
+#      xor-1/xor-2 shuffles) reading q/k/v/g/beta from threadgroup memory;
+#      each row's BF16 output goes to threadgroup memory.
+#   3. simdgroup 0 runs the norm-gate above on the head's 128 outputs (same
+#      four values per lane and simd_sum).
+# Every value takes the three-launch path's arithmetic in the same order;
+# only where the intermediates live changes (threadgroup memory instead of
+# q/k/v/g/beta/y device buffers).
+_QWEN4_DECODE_STEP_SOURCE = """
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint hv = threadgroup_position_in_grid.z;
+    const uint hk = hv / uint(HV / HK);
+    threadgroup T tq[DK];
+    threadgroup T tk[DK];
+    threadgroup T tv[DV];
+    threadgroup T ty[DV];
+    threadgroup float tg_g[1];
+    threadgroup T tg_beta[1];
+
+    // Recurrence geometry (packed kernel): four lanes per value row.
+    constexpr int lanes_per_row = 4;
+    constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+    constexpr int values_per_lane = DK / lanes_per_row;
+    constexpr int partials_per_lane = values_per_lane / 4;
+    const int lane_in_row = int(lane) & (lanes_per_row - 1);
+    const int dv_idx = int(sg) * rows_per_simdgroup + int(lane) / lanes_per_row;
+    auto i_state = state_in + (int(hv) * DV + dv_idx) * DK + lane_in_row * values_per_lane;
+    auto o_state = state_out + (int(hv) * DV + dv_idx) * DK + lane_in_row * values_per_lane;
+
+    float state[values_per_lane];
+    for (int i = 0; i < values_per_lane; ++i) {
+      state[i] = static_cast<float>(i_state[i]);
+    }
+
+    if (sg < 3) {
+        const bool is_q = sg == 0;
+        const bool is_k = sg == 1;
+        const uint head = (is_q || is_k) ? hk : hv;
+        const uint channel_base = is_q ? head * uint(DK)
+                           : (is_k ? uint(HK) * uint(DK) + head * uint(DK)
+                                   : 2 * uint(HK) * uint(DK) + head * uint(DV));
+        const bool write_conv = !(is_q || is_k) || (hv % uint(HV / HK)) == 0;
+
+        T activated[4];
+        T l2acc = T(0);
+        for (uint i = 0; i < 4; ++i) {
+            uint channel = channel_base + lane * 4 + i;
+            float acc = 0.0f;
+            for (uint tap = 0; tap < 3; ++tap) {
+                acc += float(conv_state[tap * uint(C) + channel])
+                     * float(conv_w[channel * 4 + tap]);
+            }
+            acc += float(qkv[channel]) * float(conv_w[channel * 4 + 3]);
+            const T conv = T(acc);
+            T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
+            const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+            activated[i] = act;
+            const T sqv = T(float(act) * float(act));
+            l2acc = T(float(l2acc) + float(sqv));
+            if (write_conv) {
+                conv_out[channel] = conv_state[uint(C) + channel];
+                conv_out[uint(C) + channel] = conv_state[2 * uint(C) + channel];
+                conv_out[2 * uint(C) + channel] = qkv[channel];
+            }
+        }
+
+        if (is_q || is_k) {
+            float tv_sum = float(l2acc);
+            tv_sum += simd_shuffle_xor(tv_sum, short(16));
+            tv_sum += simd_shuffle_xor(tv_sum, short(8));
+            tv_sum += simd_shuffle_xor(tv_sum, short(4));
+            tv_sum += simd_shuffle_xor(tv_sum, short(2));
+            tv_sum += simd_shuffle_xor(tv_sum, short(1));
+            const T eps_l2 = T(float(T(tv_sum)) + float(T(1e-6f)));
+            const T inv = T(metal::precise::rsqrt(float(eps_l2)));
+            for (uint i = 0; i < 4; ++i) {
+                const T l2 = T(float(activated[i]) * float(inv));
+                if (is_q) {
+                    tq[lane * 4 + i] = T(float(l2) * float(q_scale));
+                } else {
+                    tk[lane * 4 + i] = l2;
+                }
+            }
+        } else {
+            for (uint i = 0; i < 4; ++i) {
+                tv[lane * 4 + i] = activated[i];
+            }
+        }
+    } else if (sg == 3 && lane == 0) {
+        const uint head = hv;
+        const T bv = b_in[head];
+        T by = T(1) / (T(1) + metal::exp(metal::abs(bv)));
+        tg_beta[0] = (bv < T(0)) ? by : T(1) - by;
+
+        const T apd = T(float(a_in[head]) + float(dt_bias[head]));
+        const T neg_abs = -metal::abs(apd);
+        const T exp_term = T(metal::precise::exp(float(neg_abs)));
+        const T log_term = T(omlx_log1p(float(exp_term)));
+        const T positive = metal::max(apd, T(0));
+        const T sp = T(float(positive) + float(log_term));
+        float ea = metal::precise::exp(float(A_log[head]));
+        tg_g[0] = metal::precise::exp(-(ea * float(sp)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        float gt = static_cast<float>(tg_g[0]);
+        const threadgroup T* q_ = tq + lane_in_row * values_per_lane;
+        const threadgroup T* k_ = tk + lane_in_row * values_per_lane;
+
+        float part[partials_per_lane];
+        for (int pb = 0; pb < partials_per_lane; ++pb) {
+          float acc = 0.0f;
+          for (int i = 0; i < 4; ++i) {
+            int e = pb * 4 + i;
+            state[e] = state[e] * gt;
+            acc += state[e] * static_cast<float>(k_[e]);
+          }
+          part[pb] = acc;
+        }
+        float kv_mem =
+            ((part[0] + part[1]) + (part[2] + part[3])) +
+            ((part[4] + part[5]) + (part[6] + part[7]));
+        kv_mem += simd_shuffle_xor(kv_mem, 1);
+        kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+        auto delta =
+            (static_cast<float>(tv[dv_idx]) - kv_mem) *
+            static_cast<float>(tg_beta[0]);
+
+        for (int pb = 0; pb < partials_per_lane; ++pb) {
+          float acc = 0.0f;
+          for (int i = 0; i < 4; ++i) {
+            int e = pb * 4 + i;
+            state[e] = state[e] + static_cast<float>(k_[e]) * delta;
+            acc += state[e] * static_cast<float>(q_[e]);
+          }
+          part[pb] = acc;
+        }
+        float row_out =
+            ((part[0] + part[1]) + (part[2] + part[3])) +
+            ((part[4] + part[5]) + (part[6] + part[7]));
+        row_out += simd_shuffle_xor(row_out, 1);
+        row_out += simd_shuffle_xor(row_out, 2);
+        if (lane_in_row == 0) {
+          ty[dv_idx] = static_cast<T>(row_out);
+        }
+
+        for (int i = 0; i < values_per_lane; ++i) {
+          o_state[i] = static_cast<float>(state[i]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg == 0) {
+        uint base = hv * uint(DV) + lane * 4;
+        float xs[4];
+        float sumsq = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            xs[i] = float(ty[lane * 4 + i]);
+            sumsq += xs[i] * xs[i];
+        }
+        sumsq = simd_sum(sumsq);
+        float inv = metal::precise::rsqrt(sumsq / float(DV) + float(eps));
+        for (uint i = 0; i < 4; ++i) {
+            const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
+            float zv = float(z[base + i]);
+            float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(zv)));
+            float sig = zv < 0.0f ? sy : 1.0f - sy;
+            out[base + i] = T(float(normed) * sig);
+        }
     }
 """
 
@@ -654,6 +847,60 @@ def _qwen4_decode_recurrence(q, k, v, g, beta, state):
     return gated_delta_kernel(q, k, v, g, beta, state, None)
 
 
+def _qwen4_decode_step_kernel():
+    global _QWEN4_DECODE_STEP_KERNEL
+    if _QWEN4_DECODE_STEP_KERNEL is None:
+        _QWEN4_DECODE_STEP_KERNEL = mx.fast.metal_kernel(
+            name="omlx_qwen4_gdn_decode_step",
+            input_names=[
+                "qkv",
+                "z",
+                "b_in",
+                "a_in",
+                "conv_state",
+                "conv_w",
+                "q_scale",
+                "A_log",
+                "dt_bias",
+                "state_in",
+                "norm_w",
+                "eps",
+            ],
+            output_names=["conv_out", "state_out", "out"],
+            header=_QWEN4_DECODE_HEADER,
+            source=_QWEN4_DECODE_STEP_SOURCE,
+        )
+    return _QWEN4_DECODE_STEP_KERNEL
+
+
+def qwen4_decode_step_fused(
+    qkv, z, b, a, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps,
+    hk, hv, dk, dv,
+):
+    """The B1/T1 prework, recurrence and norm-gate in one launch (dk = dv = 128).
+
+    Returns (next conv state, next recurrent state, gated output [1, 1, hv*dv]),
+    bit-identical to ``qwen4_decode_prework_fused`` -> ``gated_delta_kernel``
+    -> ``_qwen4_norm_gate``. ``eps`` is the norm epsilon as a float32 array.
+    """
+    rows = dv // 8
+    return _qwen4_decode_step_kernel()(
+        inputs=[qkv, z, b, a, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps],
+        template=[
+            ("T", qkv.dtype),
+            ("HK", hk),
+            ("HV", hv),
+            ("DK", dk),
+            ("DV", dv),
+            ("C", int(qkv.shape[-1])),
+        ],
+        grid=(32, rows, hv),
+        threadgroup=(32, rows, 1),
+        output_shapes=[conv_state.shape, state.shape, (1, 1, hv * dv)],
+        output_dtypes=[qkv.dtype, state.dtype, qkv.dtype],
+    )
+
+
 def configure_qwen4_decode(model, *, wide_projections: bool) -> None:
     """Capture the decode setting per layer when the model is loaded."""
     for module in model.modules():
@@ -823,6 +1070,13 @@ def _one_row_fused_projections(linears):
     )
 
 
+# Output columns per simdgroup of the planned one-row projections (stock
+# qmv_fast owns 4): the tiles that measured fastest in a chain of 36 decode
+# layers on M5 Ultra.
+_QWEN4_IN_QMV_RPS = 2
+_QWEN4_OUT_QMV_RPS = 1
+
+
 def _build_qwen4_decode_plan(module):
     """Resolved operands of the fused B1/T1 decode, or None when ineligible."""
     if not _qwen4_decode_static_check(module):
@@ -833,20 +1087,40 @@ def _build_qwen4_decode_plan(module):
         module.in_proj_b,
         module.in_proj_a,
     )
+    fused = _one_row_fused_projections(projections)
+    in_qmv = None
+    if fused is not None:
+        weights, scales, biases, _, group_size, bits, mode = fused
+        in_qmv = one_row_qmv(
+            weights, scales, biases, bits, group_size, mode, mx.bfloat16, _QWEN4_IN_QMV_RPS
+        )
+    out = module.out_proj
+    out_qmv = one_row_qmv(
+        out.weight,
+        out.scales,
+        out.biases,
+        out.bits,
+        out.group_size,
+        out.mode,
+        mx.bfloat16,
+        _QWEN4_OUT_QMV_RPS,
+    )
     return (
         projections,
-        _one_row_fused_projections(projections),
+        fused,
         module.conv1d.weight,
         mx.array(module.head_k_dim**-0.5, dtype=mx.bfloat16),
         module.A_log,
         module.dt_bias,
         module.norm.weight,
         mx.array(module.norm.eps, dtype=mx.float32),
-        module.out_proj,
+        out,
         module.num_k_heads,
         module.num_v_heads,
         module.head_k_dim,
         module.head_v_dim,
+        in_qmv,
+        out_qmv,
     )
 
 
@@ -999,7 +1273,9 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     }
 
     def qwen4_decode(self, plan, inputs, cache):
-        """The fused B1/T1 decode on a cached plan (same launches as below)."""
+        """The fused B1/T1 decode on a cached plan, bit-identical to the per-call
+        path below: in-projection, one step launch (prework, recurrence and
+        norm-gate) and out-projection, each switchable back to its stock form."""
         (
             projections,
             fused,
@@ -1014,13 +1290,17 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             hv,
             dk,
             dv,
+            in_qmv,
+            out_qmv,
         ) = plan
         if fused is None:
             mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
         else:
             weights, w_scales, w_biases, split_indices, group_size, bits, mode = fused
-            mixed_qkv, z, b, a = mx.split(
-                mx.quantized_matmul(
+            if in_qmv is not None and _QWEN4_DECODE_QMV:
+                projected = in_qmv(inputs)
+            else:
+                projected = mx.quantized_matmul(
                     inputs,
                     weights,
                     scales=w_scales,
@@ -1029,15 +1309,23 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                     group_size=group_size,
                     bits=bits,
                     mode=mode,
-                ),
-                split_indices,
-                axis=-1,
+                )
+            mixed_qkv, z, b, a = mx.split(projected, split_indices, axis=-1)
+        if _QWEN4_DECODE_STEP_FUSED:
+            conv_state, state, gated = qwen4_decode_step_fused(
+                mixed_qkv, z, b, a, cache[0], conv_w, q_scale, A_log, dt_bias,
+                cache[1], norm_w, eps, hk, hv, dk, dv,
             )
-        q, k, v, conv_state, g, beta = qwen4_decode_prework_fused(
-            mixed_qkv, cache[0], conv_w, q_scale, b, a, A_log, dt_bias, hk, hv, dk, dv
-        )
-        out, state = _qwen4_decode_recurrence(q, k, v, g, beta, cache[1])
-        result = out_proj(_qwen4_norm_gate(out, z, norm_w, eps, hv, dv))
+        else:
+            q, k, v, conv_state, g, beta = qwen4_decode_prework_fused(
+                mixed_qkv, cache[0], conv_w, q_scale, b, a, A_log, dt_bias, hk, hv, dk, dv
+            )
+            out, state = _qwen4_decode_recurrence(q, k, v, g, beta, cache[1])
+            gated = _qwen4_norm_gate(out, z, norm_w, eps, hv, dv)
+        if out_qmv is not None and _QWEN4_DECODE_QMV:
+            result = out_qmv(gated)
+        else:
+            result = out_proj(gated)
         cache[0], cache[1] = conv_state, state
         if hasattr(cache, "advance"):
             cache.advance(1)

@@ -374,6 +374,47 @@ def test_qwen4_decode_norm_gate_is_bit_exact():
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("seed", [3, 17, 41])
+def test_qwen4_decode_step_kernel_equals_its_three_launches(dtype, seed):
+    """Prework + recurrence + norm-gate in one launch, over two chained steps.
+
+    The FP32 recurrent state is compared bit for bit; the FP32 instantiation
+    also exposes the unrounded recurrence output and gate products that the
+    BF16 output rounds away.
+    """
+    mx.random.seed(seed)
+    conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
+    q_scale = mx.array(DK**-0.5, dtype=dtype)
+    A_log = (mx.random.normal((HV,)) * 0.5).astype(dtype)
+    dt_bias = (mx.random.normal((HV,)) * 0.5).astype(dtype)
+    norm_w = (1 + mx.random.normal((DV,)) * 0.1).astype(dtype)
+    eps = mx.array(1e-6, dtype=mx.float32)
+    conv_ref = conv_new = (mx.random.normal((1, 3, C)) * 0.5).astype(dtype)
+    state_ref = state_new = mx.random.normal((1, HV, DV, DK)) * 0.1
+    for _ in range(2):
+        projected = (mx.random.normal((1, 1, C + HV * DV + 2 * HV)) * 0.8).astype(dtype)
+        qkv, z, b, a = mx.split(projected, [C, C + HV * DV, C + HV * DV + HV], axis=-1)
+        q, k, v, conv_ref, g, beta = qwen4_decode_prework_fused(
+            qkv, conv_ref, conv_w, q_scale, b, a, A_log, dt_bias, HK, HV, DK, DV
+        )
+        y, state_ref = prework_mod._qwen4_decode_recurrence(q, k, v, g, beta, state_ref)
+        gated_ref = prework_mod._qwen4_norm_gate(y, z, norm_w, eps, HV, DV)
+        conv_new, state_new, gated_new = prework_mod.qwen4_decode_step_fused(
+            qkv, z, b, a, conv_new, conv_w, q_scale, A_log, dt_bias, state_new, norm_w,
+            eps, HK, HV, DK, DV,
+        )
+        for name, expected, observed in (
+            ("conv_state", conv_ref, conv_new),
+            ("state", state_ref, state_new),
+            ("gated", gated_ref, gated_new),
+        ):
+            assert expected.dtype == observed.dtype, name
+            assert expected.shape == observed.shape, name
+            assert mx.array_equal(_bits(expected), _bits(observed)).item(), name
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_qwen4_prefill_route_is_bit_exact_across_chunks(monkeypatch):
     from mlx.utils import tree_map
     from mlx_vlm.models.cache import ArraysCache
@@ -1116,11 +1157,37 @@ def patched_decode(monkeypatch):
     ],
 )
 @pytest.mark.parametrize("seed", [3, 11])
+@pytest.mark.parametrize(
+    "step_fused, qmv", [(True, True), (True, False), (False, True), (False, False)]
+)
 def test_qwen4_planned_decode_is_bit_identical_to_per_call_path(
-    monkeypatch, patched_decode, signatures, seed
+    monkeypatch, patched_decode, signatures, seed, step_fused, qmv
 ):
+    from omlx.patches.row_exact_qmv import OneRowQmv
+
+    monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_STEP_FUSED", step_fused)
+    monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_QMV", qmv)
+    launches = []
+    step = prework_mod.qwen4_decode_step_fused
+    projection = OneRowQmv.__call__
+
+    def counted_step(*args):
+        launches.append("step")
+        return step(*args)
+
+    def counted_projection(self, x):
+        launches.append("qmv")
+        return projection(self, x)
+
+    monkeypatch.setattr(prework_mod, "qwen4_decode_step_fused", counted_step)
+    monkeypatch.setattr(OneRowQmv, "__call__", counted_projection)
     module = _real_qwen4_decode_module(signatures, seed)
     _assert_planned_decode_matches_per_call_path(monkeypatch, module, 3, seed)
+    # The planned steps ran the new launches: the step kernel, the out-projection
+    # and, when the four projections share one allocation, the in-projection.
+    projections = (1 + (len(set(signatures)) == 1)) if qmv else 0
+    assert launches.count("step") == (3 if step_fused else 0)
+    assert launches.count("qmv") == 3 * projections
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")

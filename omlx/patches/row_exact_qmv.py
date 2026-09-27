@@ -14,6 +14,10 @@ each weight block is decoded once and applied to all of them, and every
 (row, column) accumulator still sums its K blocks in qmv order and finishes
 with the same ``simd_sum`` (qmv's lane layout per column does not depend on
 how many columns a simdgroup owns or how many rows share the threadgroup).
+
+``one_row_qmv`` runs the same tile for the one-row decode call itself, with
+a narrower column tile than stock ``qmv_fast`` so more threadgroups stream
+the weights; it replaces ``quantized_matmul`` bit for bit.
 """
 
 from __future__ import annotations
@@ -477,4 +481,76 @@ def quantized_linears(linears, x: mx.array) -> tuple:
     return tuple(y.reshape(*lead, -1) for y in outputs)
 
 
-__all__ = ["MAX_ROWS", "quantized_linear", "quantized_linears"]
+class OneRowQmv:
+    """``mx.quantized_matmul`` of one row on a ``qmv_fast`` shape, bit for bit.
+
+    Stock one-row ``quantized_matmul`` runs ``qmv_fast`` with 8 output columns
+    per threadgroup (4 per simdgroup). A column's arithmetic (its lanes' K-block
+    accumulation and the closing ``simd_sum``) does not depend on how many
+    columns its simdgroup owns, so the same tile kernel with ``2 * rps``
+    columns per threadgroup gives the same bits with more threadgroups in
+    flight. At the Qwen4 GDN decode projections (1x2560 -> 16480 6-bit and
+    1x6144 -> 2560 5-bit) that runs nearer the DRAM floor than the stock
+    kernel, whose launch geometry is fixed.
+    """
+
+    __slots__ = ("_kernel", "_weights", "_template", "_grid", "_n", "_dtype")
+
+    def __init__(self, weight, scales, biases, bits, group_size, dtype, rps):
+        n = int(weight.shape[0])
+        k = int(scales.shape[-1]) * group_size
+        self._kernel = _kernel(bits, group_size, True)
+        self._weights = (weight, scales, biases)
+        self._template = [
+            ("T", dtype),
+            ("K_SIZE", k),
+            ("N_SIZE", n),
+            ("ROWS", 1),
+            ("RPS", rps),
+        ]
+        self._grid = (32, 2, n // (2 * rps))
+        self._n = n
+        self._dtype = dtype
+
+    def __call__(self, x: mx.array) -> mx.array:
+        """``x`` is one row ``[..., K]`` of the planned dtype."""
+        return self._kernel(
+            inputs=[x, *self._weights],
+            template=self._template,
+            grid=self._grid,
+            threadgroup=(32, 2, 1),
+            output_shapes=[(*x.shape[:-1], self._n)],
+            output_dtypes=[self._dtype],
+        )[0]
+
+
+def one_row_qmv(weight, scales, biases, bits, group_size, mode, dtype, rps):
+    """A ``OneRowQmv`` where stock one-row ``quantized_matmul`` runs ``qmv_fast``
+    (K a multiple of 512, N of 8) and ``2 * rps`` divides N, else None."""
+    if (
+        mode != "affine"
+        or bits not in _BITS
+        or group_size not in _GROUP_SIZES
+        or biases is None
+        or dtype not in (mx.bfloat16, mx.float16, mx.float32)
+        or weight.dtype != mx.uint32
+        or weight.ndim != 2
+        or scales.dtype != dtype
+        or biases.dtype != dtype
+        or scales.shape != biases.shape
+    ):
+        return None
+    n = int(weight.shape[0])
+    k = int(scales.shape[-1]) * group_size
+    if (
+        k % 512
+        or n % 8
+        or n % (2 * rps)
+        or scales.shape != (n, k // group_size)
+        or weight.shape[1] * 32 != k * bits
+    ):
+        return None
+    return OneRowQmv(weight, scales, biases, bits, group_size, dtype, rps)
+
+
+__all__ = ["MAX_ROWS", "OneRowQmv", "one_row_qmv", "quantized_linear", "quantized_linears"]
