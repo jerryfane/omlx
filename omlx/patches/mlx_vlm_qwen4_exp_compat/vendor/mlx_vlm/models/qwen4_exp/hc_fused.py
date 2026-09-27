@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import logging
 import os
+from itertools import chain
+from operator import is_
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -423,11 +425,16 @@ def _rows_of(hyper_input) -> int | None:
 
 def compatible(module, hyper_input) -> bool:
     """Whether ``module`` (a Qwen4ExpGatedResidual) can take the fused path for ``hyper_input``."""
-    rows = _rows_of(hyper_input)
+    # Runs for every hyper-connection of every decode step: the row gate
+    # first (prefill rows must not reach the layout checks), then the
+    # cached layout verdict.
+    if _DISABLED or not isinstance(hyper_input, mx.array):
+        return False
+    shape = hyper_input.shape
     return (
-        enabled()
-        and rows is not None
-        and 1 <= rows <= MAX_ROWS
+        len(shape) == 3
+        and hyper_input.dtype == mx.bfloat16
+        and 1 <= shape[0] * shape[1] <= MAX_ROWS
         and _layout_compatible(module, hyper_input)
     )
 
@@ -454,19 +461,21 @@ def _layout_compatible(module, hyper_input) -> bool:
 def _static_layout_compatible(module) -> bool:
     """Cached per module; any reassigned child, weight, scale or bias re-checks.
 
-    The cache keeps those objects alive so their ids cannot be reused while cached.
+    The key is the identity of every value of the module and of its child
+    modules, compared with ``is`` (``id()`` raises an audit event per call).
+    The cache keeps those objects alive so a match cannot come from a new
+    object reusing a freed one's address.
     """
-    refs = []
-    for value in dict.values(module):
-        refs.append(value)
-        if isinstance(value, nn.Module):
-            refs.extend(dict.values(value))
-    ids = tuple(map(id, refs))
     cached = module.__dict__.get("_omlx_hc_layout")
-    if cached is not None and cached[1] == ids:
-        return cached[2]
+    if cached is not None:
+        children, refs, ok = cached
+        current = tuple(chain(dict.values(module), *map(dict.values, children)))
+        if len(current) == len(refs) and all(map(is_, current, refs)):
+            return ok
     ok = _check_static_layout(module)
-    module.__dict__["_omlx_hc_layout"] = (refs, ids, ok)
+    children = [value for value in dict.values(module) if isinstance(value, nn.Module)]
+    refs = tuple(chain(dict.values(module), *map(dict.values, children)))
+    module.__dict__["_omlx_hc_layout"] = (children, refs, ok)
     return ok
 
 

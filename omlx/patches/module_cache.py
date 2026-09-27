@@ -8,9 +8,14 @@ the module's ``__dict__``. The entry is keyed on the identity of every value
 of the module and of its child modules down to ``depth`` levels (submodules,
 weights, scales, biases), the module's training flag and caller ``flags``:
 reassigning any of them rebuilds the entry on the next call. The entry keeps
-the keyed objects alive, so their ids cannot be reused while it is cached.
-Plain configuration attributes of children (bits, group_size, eps, ...) are
-construction-time constants and are not re-checked.
+the keyed objects alive, so an identity match cannot come from a new object
+reusing a freed one's address. Plain configuration attributes of children
+(bits, group_size, eps, ...) are construction-time constants and are not
+re-checked.
+
+Identities are compared with ``operator.is_`` rather than ``id()``: once an
+audit hook is installed (mlx-vlm's imports install one), every ``id()`` call
+raises an audit event and costs several times more.
 
 Built values must not reference ``module`` itself (only its children and
 tensors), so the entry creates no reference cycle through the module.
@@ -19,6 +24,7 @@ tensors), so the entry creates no reference cycle through the module.
 from __future__ import annotations
 
 from itertools import chain
+from operator import is_
 from typing import Any, Callable
 
 import mlx.nn as nn
@@ -47,20 +53,18 @@ def cached_per_module(
     flags: tuple = (),
 ) -> Any:
     """``build(module)``, cached in ``module.__dict__[slot]`` (see module docstring)."""
+    state = (module._training, flags)
     entry = module.__dict__.get(slot)
     if entry is not None:
-        children, _refs, key, value = entry
-        if key == (
-            module._training,
-            flags,
-            *map(id, chain(dict.values(module), *map(dict.values, children))),
-        ):
-            return value
+        children, refs, cached_state, value = entry
+        if cached_state == state:
+            current = tuple(chain(dict.values(module), *map(dict.values, children)))
+            if len(current) == len(refs) and all(map(is_, current, refs)):
+                return value
     value = build(module)
     children = _children(module, depth)
-    refs = list(chain(dict.values(module), *map(dict.values, children)))
-    key = (module._training, flags, *map(id, refs))
-    module.__dict__[slot] = (children, refs, key, value)
+    refs = tuple(chain(dict.values(module), *map(dict.values, children)))
+    module.__dict__[slot] = (children, refs, state, value)
     return value
 
 
