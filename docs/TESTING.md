@@ -68,6 +68,10 @@ Related regression suites are `test_qwen4_qsa_incremental_cache.py`, `test_qwen4
 
 For Qwen4 native sparse-GQA prefill measurements, run `python benchmarks/bench_qwen4_qsa_sparse_gqa.py --key-tokens 24576 --query-tokens 1024 --repetitions 30`. The benchmark reports index scoring, top-k selection, the combined native pipeline, every supported main-attention tile, the portable reference, and maximum error. Production groups native query rows into 4,096-row tiles through 32K keys, 2,048-row tiles through 64K, and 1,024-row tiles above 64K; this bounds the FP32 score sheet while amortizing per-tile dispatch.
 
+# Qwen4 verify attention row tests
+
+Run `python -m pytest -q tests/test_qwen4_verify_attention_rows.py` to check that row-exact Lightning MTP verify windows through Qwen4 attention give every row the bits of the serial one-row decode step and leave the same KV and QSA indexer state. The tests build one attention layer at the real Flash-Next shapes with synthetic 6-bit weights. Masked-arm windows (past the 2,048-token QSA budget, rank-three positions) cover 2 to 8 rows at 2,060, 16,382 and 24,000 cached tokens and compare each row's FP32 block scores and token mask; a rollback case accepts one draft and decodes on. Dense windows below the budget include rows on both sides of MLX's one-pass/two-pass vector SDPA switch at 1,024 keys. `OMLX_QWEN4_QSA_MASKED_VERIFY=0` restores the multi-row masked path.
+
 # Prefill memory accounting tests
 
 Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_prefill_oom_graceful.py` to check retained versus reclaimed overhead, configured chunk sizes, and abort-cap enforcement. The loop tests run a small initialized MLX model with controlled footprint readings through external and chunked prefill; they do not load a checkpoint.

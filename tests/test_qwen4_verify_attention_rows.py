@@ -2,9 +2,12 @@
 """Row-exact Lightning MTP verify rows through Qwen4 attention.
 
 Every verify row must get the bits of the serial one-row decode step at its
-position and leave the cache exactly as the serial steps would. Below the QSA
-block budget a serial step runs MLX's vector SDPA over its whole prefix, on a
-kernel plan that depends on its key count. Real attention shapes (2560 hidden, 24/2 heads of 256, a 4x128
+position and leave the cache exactly as the serial steps would. Past the QSA
+block budget (rank-three positions, below the gathered crossover) a serial
+step attends through ``_masked_decode``: one-row block scores, the one-launch
+selection kernel and the selected-keys SDPA. Below the budget it runs MLX's
+vector SDPA over its whole prefix, on a kernel plan that depends on its key
+count. Real attention shapes (2560 hidden, 24/2 heads of 256, a 4x128
 indexer, 2048-token budget), synthetic 6-bit weights.
 """
 
@@ -202,6 +205,68 @@ def _record_selection(monkeypatch):
 
 def _bit_equal(a: mx.array, b: mx.array) -> bool:
     return a.shape == b.shape and a.dtype == b.dtype and mx.array_equal(a, b).item()
+
+
+# 2060: the window starts just past the sparse crossover; 16382: its rows
+# straddle MLX's two-pass partition switch at 16384 keys (the multi-row MLX
+# path gave row 0 of a two-row window the 16384-key plan); 24000: the served
+# 24K case.
+@pytest.mark.parametrize("context", [2060, 16382, 24000])
+@pytest.mark.parametrize("rows", [2, 3, 4, 8])
+def test_masked_verify_rows_equal_serial_decode_steps(monkeypatch, context, rows):
+    attn = _attention(seed=3)
+    cache = _prefill(attn, context, seed=4)
+    selections = _record_selection(monkeypatch)
+    for seed in (11, 12):
+        mx.random.seed(seed + rows)
+        x = (mx.random.normal((1, rows, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+
+        verified = _verify(attn, cache, x)
+        verified_state = _state(cache)
+        verified_selections = selections[:]
+        selections.clear()
+        cache.trim(rows)
+
+        serial = _serial(attn, cache, x)
+        serial_state = _state(cache)
+        serial_selections = selections[:]
+        selections.clear()
+        cache.trim(rows)
+
+        assert _bit_equal(verified, serial)
+        for got, want in zip(verified_state, serial_state):
+            assert _bit_equal(got, want)
+        # Each row's FP32 block scores and selected tokens: the multi-row
+        # scores are a GEMM that rounds differently and can flip a selection
+        # at the cut-off.
+        assert len(verified_selections) == len(serial_selections) == rows
+        for (scores, keys, mask), (want_scores, want_keys, want_mask) in zip(
+            verified_selections, serial_selections
+        ):
+            assert keys == want_keys
+            assert _bit_equal(scores, want_scores)
+            assert _bit_equal(mask, want_mask)
+
+
+def test_masked_verify_rollback_then_decode_matches_serial():
+    """Accept one draft of a four-row window, roll the rest back, decode on."""
+    attn = _attention(seed=5)
+    reference = _prefill(attn, 24002, seed=6)
+    cache = _prefill(attn, 24002, seed=6)
+    mx.random.seed(21)
+    window = (mx.random.normal((1, 4, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+    follow = (mx.random.normal((1, 3, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+
+    verified = _verify(attn, cache, window)
+    cache.trim(2)  # rows 2 and 3 rejected
+    resumed = _serial(attn, cache, follow)
+
+    expected = _serial(attn, reference, window[:, :2])
+    expected_resumed = _serial(attn, reference, follow)
+    assert _bit_equal(verified[:, :2], expected)
+    assert _bit_equal(resumed, expected_resumed)
+    for got, want in zip(_state(cache), _state(reference)):
+        assert _bit_equal(got, want)
 
 
 # Below the block budget: 700 keys stays on MLX's one-pass vector kernel;
