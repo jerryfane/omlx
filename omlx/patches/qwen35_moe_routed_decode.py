@@ -25,6 +25,10 @@ same arithmetic in two launches after the router:
    follows: score products summed in MLX's ``col_reduce_small`` order, plus
    ``sigmoid(shared_gate) * shared``.
 
+The router ahead of them (gate linear, precise softmax, fused top-k) runs
+its softmax and top-k as one launch (``qwen35_moe_router.softmax_topk_row``)
+where the expert count allows.
+
 The result is bit-identical to the composed path. The quantized dot products
 reuse the MLX 0.32.2 transcription in ``moe_verify_gather`` (4, 5, 6 and
 8 bits; group size 32, 64 or 128), one instantiation per weight format. MLX
@@ -598,7 +602,7 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
         from mlx_vlm.models.qwen3_5_moe import language as vlm_moe
     except ImportError:
         return False
-    from .qwen35_moe_router import fused_router_topk, router_eligible
+    from .qwen35_moe_router import fused_router_topk, router_eligible, softmax_topk_row
 
     cls = getattr(vlm_moe, "Qwen3_5MoeSparseMoeBlock", None)
     if cls is None or not getattr(cls, "_omlx_router_fused", False):
@@ -619,8 +623,11 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
             shared_gate = self["shared_expert_gate"](x)
             if shared.dtype != x.dtype or shared_gate.dtype != x.dtype:
                 return orig_call(self, x)
-        gates = mx.softmax(self["gate"](x), axis=-1, precise=True)
-        inds, scores = fused_router_topk(gates, self.top_k)
+        logits = self["gate"](x)
+        routing = softmax_topk_row(logits, self.top_k)
+        if routing is None:
+            routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), self.top_k)
+        inds, scores = routing
         if scores.dtype != x.dtype:
             return orig_call(self, x)
         try:

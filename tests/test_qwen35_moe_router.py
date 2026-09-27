@@ -231,3 +231,81 @@ def test_one_row_moe_block_matches_composed_combine(monkeypatch, seed):
     mx.eval(actual)
     assert calls == [(1, 1, 10, 2560)] * 2
     assert _same_bits(actual, expected)
+
+
+def _near_tie_logits(kind, experts, seed):
+    """Router logits whose probabilities tie or sit one bf16 ulp apart."""
+    mx.random.seed(seed)
+    if kind == "random":
+        logits = mx.random.normal((experts,)) * (1 + seed % 7)
+    elif kind == "duplicates":  # every logit appears 8 times
+        base = mx.random.normal((experts // 8,)) * 3
+        logits = mx.concatenate([base] * 8)[mx.random.permutation(experts)]
+    elif kind == "adjacent":  # 24 logits on three adjacent bf16 values
+        logits = mx.random.normal((experts,)) * 0.5
+        ids = mx.random.permutation(experts)[:24]
+        top = mx.array(4.0, dtype=mx.bfloat16).view(mx.uint16)
+        near = (top - (mx.arange(24) % 3).astype(mx.uint16)).view(mx.bfloat16)
+        logits = logits.at[ids].add(near.astype(mx.float32) - logits[ids])
+    else:  # two values only
+        logits = (mx.random.uniform(shape=(experts,)) < 0.5) * 1e-3
+    return logits.astype(mx.bfloat16).reshape(1, 1, experts)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("experts", [512, 128])
+@pytest.mark.parametrize("kind", ["random", "duplicates", "adjacent", "two_values"])
+def test_softmax_topk_row_matches_softmax_then_topk(experts, kind):
+    from omlx.patches.qwen35_moe_router import softmax_topk_row
+
+    for seed in range(40):
+        logits = _near_tie_logits(kind, experts, seed)
+        ref_i, ref_s = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), 10)
+        out_i, out_s = softmax_topk_row(logits, 10)
+        assert mx.array_equal(ref_i, out_i).item()
+        assert mx.array_equal(ref_s.view(mx.uint16), out_s.view(mx.uint16)).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("experts", [512, 256])
+def test_softmax_row_matches_mlx_softmax_in_fp32(experts):
+    """Rounded BF16 probabilities hide one-ulp FP32 differences (a fast-math
+    reciprocal or a precise exp passes the routing test), so run the softmax
+    in FP32 against MLX's FP32 softmax, which shares its reduction."""
+    from omlx.patches import qwen35_moe_router as router
+
+    probe = mx.fast.metal_kernel(
+        name="test_router_softmax_row_probe",
+        input_names=["logits"],
+        output_names=["p"],
+        header=router._SOFTMAX_ROW_HEADER,
+        source="""
+        const uint lane = thread_position_in_threadgroup.x;
+        float vals[NE / 32];
+        omlx_router_softmax_row<T, NE>(logits, lane, vals);
+        for (int k = 0; k < NE / 32; k++) {
+          p[((k / 4) * 32 + lane) * 4 + (k % 4)] = vals[k];
+        }
+        """,
+    )
+    for seed, kind in enumerate(["random", "duplicates", "adjacent", "two_values"] * 10):
+        logits = _near_tie_logits(kind, experts, seed).astype(mx.float32).reshape(experts)
+        out = probe(
+            inputs=[logits],
+            template=[("T", mx.float32), ("NE", experts)],
+            grid=(32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(experts,)],
+            output_dtypes=[mx.float32],
+        )[0]
+        ref = mx.softmax(logits, axis=-1)
+        assert mx.array_equal(out.view(mx.uint32), ref.view(mx.uint32)).item()
+
+
+def test_softmax_topk_row_declines_layouts_it_does_not_reproduce():
+    from omlx.patches.qwen35_moe_router import softmax_topk_row
+
+    # MLX's softmax ends 320 experts in a partial simdgroup.
+    assert softmax_topk_row(mx.zeros((1, 1, 320), mx.bfloat16), 10) is None
+    assert softmax_topk_row(mx.zeros((1, 2, 512), mx.bfloat16), 10) is None
+    assert softmax_topk_row(mx.zeros((1, 1, 512), mx.float16), 10) is None
