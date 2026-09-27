@@ -321,6 +321,270 @@ def decode_block_selection_mask(
         return None
 
 
+# One masked decode row's SDPA on the official arm. MLX runs its two-pass
+# vector kernels there (sdpa_vector_2pass_1 with a bool mask, then
+# sdpa_vector_2pass_2): key i goes to partition i % blocks, and every partition
+# walks all of its positions reading one mask byte each. With ~2K of 24K keys
+# selected that walk is most of the time. The kernels below are those two,
+# transcribed, except that a partition first ballots its mask bytes 32 at a
+# time and then visits only the selected keys, in the same increasing order:
+# same partitions, same visiting order, same float operations, same bits.
+# The partition count is MLX's rule for the GPU class; only the 'd' class is
+# transcribed (and verified), other GPUs keep MLX.
+# OMLX_QWEN4_QSA_DECODE_SDPA=0 keeps mx.fast.scaled_dot_product_attention.
+_DECODE_SDPA_DISABLED = os.environ.get(
+    "OMLX_QWEN4_QSA_DECODE_SDPA", "1"
+).strip().lower() in {"0", "false", "no", "off"}
+_DECODE_SDPA_KERNELS: list = []
+_DECODE_SDPA_VALIDATED: set[tuple] = set()
+_DECODE_SDPA_SCALES: dict[float, mx.array] = {}
+
+_DECODE_SDPA_PASS1_SOURCE = r"""
+    constexpr int BD = 32;
+    constexpr int qk_per_thread = D / BD;
+    constexpr int v_per_thread = V / BD;
+    typedef float U;
+
+    thread U q[qk_per_thread];
+    thread U o[v_per_thread] = {0};
+
+    const int kv_head_idx = threadgroup_position_in_grid.x;
+    const int block_idx = threadgroup_position_in_grid.z;
+    const int gqa_factor = threads_per_threadgroup.y;
+    const int q_head_idx = gqa_factor * kv_head_idx + thread_position_in_threadgroup.y;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const int N = int(keys_shape[2]);
+    const int k_seq_stride = int(keys_strides[2]);
+    const int v_seq_stride = int(values_strides[2]);
+    const int mask_stride = int(mask_strides[3]);
+
+    const device T* kp = keys + kv_head_idx * keys_strides[1]
+        + block_idx * k_seq_stride + simd_lid * qk_per_thread * keys_strides[3];
+    const device T* vp = values + kv_head_idx * values_strides[1]
+        + block_idx * v_seq_stride + simd_lid * v_per_thread * values_strides[3];
+
+    const float sc = scale[0];
+    for (int i = 0; i < qk_per_thread; i++) {
+        q[i] = static_cast<U>(sc) * queries[
+            q_head_idx * queries_strides[1] + (simd_lid * qk_per_thread + i) * queries_strides[3]];
+    }
+
+    U max_score = Limits<U>::finite_min;
+    U sum_exp_score = 0;
+
+    // This partition's positions are block_idx + t * BLOCKS.
+    const int count = N > block_idx ? (N - block_idx + BLOCKS - 1) / BLOCKS : 0;
+    for (int base = 0; base < count; base += 32) {
+        const int t = base + int(simd_lid);
+        const bool use = t < count && mask[(block_idx + t * BLOCKS) * mask_stride];
+        uint64_t selected = uint64_t(simd_ballot(use));
+        while (selected != 0) {
+            const int step = base + int(ctz(selected));
+            selected &= selected - 1;
+            const device T* ki = kp + step * BLOCKS * k_seq_stride;
+            const device T* vi = vp + step * BLOCKS * v_seq_stride;
+
+            U score = 0;
+            for (int i = 0; i < qk_per_thread; i++) {
+                score += q[i] * ki[i * keys_strides[3]];
+            }
+            score = simd_sum(score);
+
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            for (int i = 0; i < v_per_thread; i++) {
+                o[i] = o[i] * factor + exp_score * vi[i * values_strides[3]];
+            }
+        }
+    }
+
+    const int o_offset = q_head_idx;
+    if (simd_lid == 0) {
+        sums[o_offset * BLOCKS + block_idx] = sum_exp_score;
+        maxs[o_offset * BLOCKS + block_idx] = max_score;
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+        partials[o_offset * BLOCKS * V + block_idx * V + simd_lid * v_per_thread + i] =
+            static_cast<T>(o[i]);
+    }
+"""
+
+_DECODE_SDPA_PASS2_SOURCE = r"""
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int elem_per_thread = D / BD;
+    typedef float U;
+
+    thread U o[elem_per_thread] = {0};
+    threadgroup U outputs[BN * BD];
+
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const int q_offset = threadgroup_position_in_grid.x;
+    const device T* pp = partials + q_offset * BLOCKS * D + simd_gid * D
+        + simd_lid * elem_per_thread;
+    const device float* sp = sums + q_offset * BLOCKS;
+    const device float* mp = maxs + q_offset * BLOCKS;
+
+    U sum_exp_score = 0.0;
+    U max_score = Limits<U>::finite_min;
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        max_score = max(max_score, mp[simd_lid + BN * b]);
+    }
+    max_score = simd_max(max_score);
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = fast::exp(mp[simd_lid + BN * b] - max_score);
+        sum_exp_score += factor * sp[simd_lid + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = fast::exp(mp[simd_gid] - max_score);
+        for (int i = 0; i < elem_per_thread; i++) {
+            o[i] += factor * static_cast<U>(pp[i]);
+        }
+        mp += BN;
+        sp += BN;
+        pp += BN * D;
+    }
+
+    for (int i = 0; i < elem_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        for (int i = 0; i < elem_per_thread; i++) {
+            out[q_offset * D + simd_gid * elem_per_thread + i] = static_cast<T>(o[i]);
+        }
+    }
+"""
+
+
+@functools.lru_cache(maxsize=None)
+def _gpu_class() -> str:
+    try:
+        return str(mx.device_info().get("architecture", ""))[-1:]
+    except Exception:
+        return ""
+
+
+def _two_pass_blocks(n_simds: int, keys: int) -> int | None:
+    """MLX 0.32.2's sdpa_vector_2pass partition count; None where not transcribed."""
+
+    if _gpu_class() != "d" or n_simds < 6:
+        return None
+    if keys < 16384:
+        return 128
+    if keys < 65536:
+        return 512
+    return 1024
+
+
+def masked_decode_sdpa(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    mask: mx.array,
+    scale: float,
+) -> mx.array | None:
+    """``mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale,
+    mask=mask)`` for one decode row with a bool key mask, bit for bit, visiting
+    only the unmasked keys; None where MLX's kernel plan is not transcribed."""
+
+    global _DECODE_SDPA_DISABLED
+    if _DECODE_SDPA_DISABLED:
+        return None
+    if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4 or mask.ndim != 4:
+        return None
+    _, query_heads, rows, head_dim = queries.shape
+    kv_heads, key_len = keys.shape[1], keys.shape[2]
+    if (
+        queries.shape[0] != 1
+        or rows != 1
+        or head_dim != 256
+        or keys.shape != (1, kv_heads, key_len, head_dim)
+        or values.shape != keys.shape
+        or queries.dtype not in (mx.bfloat16, mx.float16)
+        or keys.dtype != queries.dtype
+        or values.dtype != queries.dtype
+        or mask.dtype != mx.bool_
+        or mask.shape != (1, 1, 1, key_len)
+        or key_len < 1024  # below it MLX may run the one-pass kernel
+        or query_heads % kv_heads
+    ):
+        return None
+    gqa_factor = query_heads // kv_heads
+    blocks = _two_pass_blocks(gqa_factor * rows, key_len)
+    if blocks is None:
+        return None
+    try:
+        if not _DECODE_SDPA_KERNELS:
+            _DECODE_SDPA_KERNELS.append(
+                mx.fast.metal_kernel(
+                    name="omlx_qwen4_masked_decode_sdpa_1",
+                    input_names=["queries", "keys", "values", "mask", "scale"],
+                    output_names=["partials", "sums", "maxs"],
+                    source=_DECODE_SDPA_PASS1_SOURCE,
+                    ensure_row_contiguous=False,
+                )
+            )
+            _DECODE_SDPA_KERNELS.append(
+                mx.fast.metal_kernel(
+                    name="omlx_qwen4_masked_decode_sdpa_2",
+                    input_names=["partials", "sums", "maxs"],
+                    output_names=["out"],
+                    source=_DECODE_SDPA_PASS2_SOURCE,
+                )
+            )
+        pass_1, pass_2 = _DECODE_SDPA_KERNELS
+        scale_array = _DECODE_SDPA_SCALES.get(scale)
+        if scale_array is None:
+            # MLX hands the kernel the FP32 value of the Python float.
+            scale_array = mx.array([scale], dtype=mx.float32)
+            mx.eval(scale_array)
+            _DECODE_SDPA_SCALES[scale] = scale_array
+        dtype = queries.dtype
+        partials, sums, maxs = pass_1(
+            inputs=[queries, keys, values, mask, scale_array],
+            template=[("T", dtype), ("D", head_dim), ("V", head_dim), ("BLOCKS", blocks)],
+            grid=(32 * kv_heads, gqa_factor, blocks),
+            threadgroup=(32, gqa_factor, 1),
+            output_shapes=[
+                (query_heads, blocks, head_dim),
+                (query_heads, blocks),
+                (query_heads, blocks),
+            ],
+            output_dtypes=[dtype, mx.float32, mx.float32],
+        )
+        output = pass_2(
+            inputs=[partials, sums, maxs],
+            template=[("T", dtype), ("D", head_dim), ("BLOCKS", blocks)],
+            grid=(query_heads * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(1, query_heads, 1, head_dim)],
+            output_dtypes=[dtype],
+        )[0]
+        signature = (dtype, head_dim, gqa_factor, blocks)
+        if signature not in _DECODE_SDPA_VALIDATED:
+            mx.eval(output)
+            _DECODE_SDPA_VALIDATED.add(signature)
+        return output
+    except Exception:
+        _DECODE_SDPA_DISABLED = True
+        return None
+
+
 _TOKEN_MAJOR_MIN_QUERIES = 32
 _TOKEN_MAJOR_MAX_TOKENS = 131072
 
@@ -1003,5 +1267,6 @@ __all__ = [
     "contiguous_causal_gathered_qsa_decode",
     "contiguous_causal_query_chunk",
     "decode_block_selection_mask",
+    "masked_decode_sdpa",
     "pool_completed_index_keys",
 ]

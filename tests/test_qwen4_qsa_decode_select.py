@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One-launch Qwen4 QSA decode selection against the official indexer ops.
+"""One-launch Qwen4 QSA decode selection and selected-keys SDPA against MLX.
 
 An aligned one-row decode (masked-SDPA arm, below the gathered crossover)
 used to score the pooled blocks with maximum/sum/divide, pick the winners with
 ``mx.argpartition`` and widen them to a token mask with ~20 more ops. The
 kernel must produce the identical mask: same FP32 scores, the same winners on
-ties (MLX's stable ascending sort keeps the highest indices), NaN above +inf,
--0 == +0.
+ties (MLX's stable ascending sort keeps the highest indices), NaN above +inf.
+The masked SDPA then visits only the selected keys but must keep MLX's
+two-pass partitions, order and arithmetic: the same bits.
 """
 
 from __future__ import annotations
@@ -181,7 +182,7 @@ def _attention_and_caches(key_len: int):
         model_type="qwen4_exp_text",
         hidden_size=256,
         num_hidden_layers=1,
-        num_attention_heads=4,
+        num_attention_heads=24,
         linear_num_value_heads=4,
         linear_num_key_heads=2,
         linear_key_head_dim=8,
@@ -195,7 +196,7 @@ def _attention_and_caches(key_len: int):
         vocab_size=64,
         num_key_value_heads=2,
         max_position_embeddings=65536,
-        head_dim=64,
+        head_dim=256,
         layer_types=["full_attention"],
         ple_layer_ids=[],
         ple_embed_dim=32,
@@ -214,9 +215,10 @@ def _attention_and_caches(key_len: int):
     )
     mx.random.seed(3)
     attention = language.Qwen4ExpAttention(config)
+    attention.set_dtype(mx.bfloat16)
     mx.eval(attention.parameters())
-    keys = mx.random.normal((1, 2, key_len, 64)).astype(mx.bfloat16)
-    values = mx.random.normal((1, 2, key_len, 64)).astype(mx.bfloat16)
+    keys = mx.random.normal((1, 2, key_len, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 2, key_len, 256)).astype(mx.bfloat16)
     index_keys = mx.random.normal((1, key_len, HEAD_DIM)).astype(mx.bfloat16)
     positions = mx.arange(key_len, dtype=mx.int32)[None]
     caches = []
@@ -229,34 +231,95 @@ def _attention_and_caches(key_len: int):
     return config, attention, caches
 
 
-def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch):
+def _set_kernels(monkeypatch, enabled: bool):
+    monkeypatch.setattr(qsa_fast, "_DECODE_SELECT_DISABLED", not enabled)
+    monkeypatch.setattr(qsa_fast, "_DECODE_SDPA_DISABLED", not enabled)
+
+
+@pytest.mark.parametrize("key_len", [3001, 16390])
+def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch, key_len):
     """Rank-three (served below the gathered crossover) decode through the
     module: outputs and every cache array equal, across block completions."""
-    config, attention, (fast_cache, ops_cache) = _attention_and_caches(3001)
-    kernel_masks = []
+    config, attention, (fast_cache, ops_cache) = _attention_and_caches(key_len)
+    ran = {"mask": 0, "sdpa": 0}
 
-    def recording(*args, **kwargs):
-        mask = qsa_fast.decode_block_selection_mask(*args, **kwargs)
-        if mask is not None:
-            kernel_masks.append(mask)
-        return mask
+    def recording(name, function):
+        def wrapper(*args, **kwargs):
+            result = function(*args, **kwargs)
+            ran[name] += result is not None
+            return result
 
-    monkeypatch.setattr(language, "decode_block_selection_mask", recording)
+        return wrapper
+
+    monkeypatch.setattr(
+        language,
+        "decode_block_selection_mask",
+        recording("mask", qsa_fast.decode_block_selection_mask),
+    )
+    monkeypatch.setattr(
+        language, "masked_decode_sdpa", recording("sdpa", qsa_fast.masked_decode_sdpa)
+    )
     for step in range(6):
         x = mx.random.normal((1, 1, config.hidden_size)).astype(mx.bfloat16)
         offset = fast_cache.offset
         positions = mx.broadcast_to(mx.array([[offset]], dtype=mx.int32)[None], (3, 1, 1))
-        monkeypatch.setattr(qsa_fast, "_DECODE_SELECT_DISABLED", False)
+        _set_kernels(monkeypatch, True)
         fast = attention(x, mask=None, cache=fast_cache, position_ids=positions)
-        monkeypatch.setattr(qsa_fast, "_DECODE_SELECT_DISABLED", True)
+        _set_kernels(monkeypatch, False)
         ops = attention(x, mask=None, cache=ops_cache, position_ids=positions)
         mx.eval(fast, ops)
         assert mx.array_equal(fast.view(mx.uint16), ops.view(mx.uint16)).item(), step
-    assert len(kernel_masks) == 6
+    assert ran["mask"] == 6
+    if qsa_fast._gpu_class() == "d":
+        assert ran["sdpa"] == 6
     for fast_state, ops_state in zip(fast_cache.state, ops_cache.state):
         assert mx.array_equal(fast_state, ops_state).item()
     pooled = fast_cache._pooled_index_offset
-    assert pooled == ops_cache._pooled_index_offset == 3007 // RATIO
+    assert pooled == ops_cache._pooled_index_offset == (key_len + 6) // RATIO
     assert mx.array_equal(
         fast_cache._pooled_index_keys[:, :pooled], ops_cache._pooled_index_keys[:, :pooled]
     ).item()
+
+
+@pytest.mark.skipif(
+    qsa_fast._gpu_class() != "d",
+    reason="MLX's two-pass partition count is transcribed for 'd'-class GPUs only",
+)
+@pytest.mark.parametrize(
+    "key_len",
+    [
+        2052,
+        16383,  # last 128-partition length
+        16384,  # first 512-partition length
+        65536,  # first 1024-partition length
+    ],
+)
+@pytest.mark.parametrize("kind", ["qsa", "sparse_head", "all"])
+def test_masked_decode_sdpa_matches_mlx_bit_for_bit(key_len, kind):
+    rng = np.random.default_rng(key_len)
+    capacity = key_len + 777
+    # Cache-shaped views: a prefix of a larger buffer, as update_and_fetch returns.
+    keys = mx.random.normal((1, 2, capacity, 256), key=mx.random.key(1)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 2, capacity, 256), key=mx.random.key(2)).astype(mx.bfloat16)
+    keys, values = keys[:, :, :key_len], values[:, :, :key_len]
+    queries = (4 * mx.random.normal((1, 24, 1, 256), key=mx.random.key(3))).astype(mx.bfloat16)
+    selected = np.zeros(key_len, dtype=bool)
+    if kind == "qsa":
+        blocks = key_len // RATIO
+        for block in rng.choice(blocks, TOPK, replace=False):
+            selected[block * RATIO : (block + 1) * RATIO] = True
+        selected[blocks * RATIO :] = True
+    elif kind == "sparse_head":
+        selected[:37] = True  # most partitions see no key at all
+    else:
+        selected[:] = True
+    mask = mx.array(selected).reshape(1, 1, 1, key_len)
+
+    actual = qsa_fast.masked_decode_sdpa(queries, keys, values, mask, 256**-0.5)
+    expected = mx.fast.scaled_dot_product_attention(
+        queries, keys, values, scale=256**-0.5, mask=mask
+    )
+
+    assert actual is not None
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16)).item()

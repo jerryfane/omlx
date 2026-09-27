@@ -39,6 +39,7 @@ from .qsa_fast import (
     contiguous_causal_gathered_qsa,
     contiguous_causal_gathered_qsa_decode,
     decode_block_selection_mask,
+    masked_decode_sdpa,
     pool_completed_index_keys,
 )
 from . import hc_fused
@@ -1988,6 +1989,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             return _VERIFIER._attention(
                 self, x, mask, cache, position_ids, position_embeddings
             )
+        if (
+            qsa_mask is not None
+            and mask is qsa_mask
+            and x.shape[:2] == (1, 1)
+            and type(cache) is QSAKVCache
+            and position_embeddings is None
+        ):
+            return self._masked_decode(x, mask, cache, position_ids)
         return super().__call__(
             x,
             mask=mask,
@@ -1995,6 +2004,36 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_ids=position_ids,
             position_embeddings=position_embeddings,
         )
+
+    def _masked_decode(
+        self,
+        x: mx.array,
+        mask: mx.array,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array],
+    ) -> mx.array:
+        """``Qwen3_5Attention.__call__`` for one QSA-masked decode row, with an
+        SDPA that visits only the selected keys (same bits as MLX's)."""
+
+        from ..qwen3_5 import language as q35_language
+
+        batch, length, _ = x.shape
+        queries, keys, values, gate, mask = self._prepare_projected_qkv(
+            self.q_proj(x),
+            self.k_proj(x),
+            self.v_proj(x),
+            cache,
+            position_ids,
+            None,
+            mask,
+        )
+        output = masked_decode_sdpa(queries, keys, values, mask, self.scale)
+        if output is None:
+            output = q35_language.scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
+        output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        return self.o_proj(output * mx.sigmoid(gate))
 
 
 class Qwen4ExpGatedResidual(nn.Module):
