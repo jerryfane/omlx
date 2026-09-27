@@ -8,9 +8,15 @@ the stream norm and the mixing/inject epilogue. Both need four streams and
 affine group-size-64 projections with 4/5/6/8-bit weights. FP32 epilogues
 can round differently from the canonical BF16 operations.
 
+A pending residual write (previous block's branch times its injection gate)
+can be applied inside the stream norm, which also stores the written
+residual; it rounds exactly like the eager multiply and add.
+
 Each kernel specialization is evaluated once to catch lazy compilation errors.
 Failures only fall back for the current call; later evaluation errors propagate.
-Disable with OMLX_QWEN4_HC_FUSED=0.
+Disable with OMLX_QWEN4_HC_FUSED=0. OMLX_QWEN4_HC_FUSED_WRITE=0 keeps the
+decode residual writes eager and stops deferring each layer's tail write into
+the next hyper-connection norm.
 """
 
 from __future__ import annotations
@@ -28,12 +34,14 @@ logger = logging.getLogger(__name__)
 MAX_ROWS = 16
 _GROUP_SIZE = 64
 _SUPPORTED_BITS = (4, 5, 6, 8)
-_DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "1").strip().lower() in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+
+
+def _env_disabled(name: str) -> bool:
+    return os.environ.get(name, "1").strip().lower() in {"0", "false", "no", "off"}
+
+
+_DISABLED = _env_disabled("OMLX_QWEN4_HC_FUSED")
+_WRITE_DISABLED = _env_disabled("OMLX_QWEN4_HC_FUSED_WRITE")
 _KERNELS: dict[str, object] = {}
 _VALIDATED: set[tuple] = set()
 _FAILURE_LOGGED = False
@@ -303,6 +311,11 @@ def enabled() -> bool:
     return not _DISABLED
 
 
+def write_enabled() -> bool:
+    """Whether residual writes may be deferred into the next fused stream norm."""
+    return not (_DISABLED or _WRITE_DISABLED)
+
+
 def _quantized_ok(projection) -> bool:
     return (
         type(projection) is nn.QuantizedLinear
@@ -418,9 +431,10 @@ def _eps_array(module) -> mx.array:
 # Prefill keeps Qwen4ExpRMSNorm's precise rsqrt; only the f32 sum order differs.
 _NP_SOURCE = _N_SOURCE.replace("metal::rsqrt", "metal::precise::rsqrt")
 
-# The previous block's residual write fused into the prefill stream norm:
+# The previous block's residual write fused into the stream norm:
 # - y = T(x + T(branch * gate[s])) rounds like the eager multiply and add.
-# - y is stored as the new residual stream and normalized as in _NP_SOURCE.
+# - y is stored as the new residual stream and normalized as in _NP_SOURCE
+#   (prefill) or _N_SOURCE (decode, _WND_SOURCE below).
 _WN_SOURCE = r"""
     const uint row = threadgroup_position_in_grid.z;
     const uint s = threadgroup_position_in_grid.y;
@@ -457,6 +471,9 @@ _WN_SOURCE = r"""
     }
 """
 
+# Decode keeps _N_SOURCE's fast rsqrt so rows match the unfused decode norm.
+_WND_SOURCE = _WN_SOURCE.replace("metal::precise::rsqrt", "metal::rsqrt")
+
 
 def _kernel_norm(module, flat, rows, hc, hidden, dtype, precise=False):
     width = hc * hidden
@@ -473,13 +490,38 @@ def _kernel_norm(module, flat, rows, hc, hidden, dtype, precise=False):
     )[0]
 
 
-def _kernel_write_norm(module, flat, branch, gate, rows, hc, hidden, dtype):
+def _write_operands(hyper_input, write, hidden, hc):
+    """Flattened (branch, gate) for the write-norm kernels, or None if they cannot take it.
+
+    Mixed dtypes would promote the eager write, so only same-dtype operands qualify.
+    """
+    branch, gate = write
+    lead = hyper_input.shape[:-1]
+    dtype = hyper_input.dtype
+    if not (
+        isinstance(branch, mx.array)
+        and isinstance(gate, mx.array)
+        and branch.shape == (*lead, hidden)
+        and gate.shape == (*lead, hc)
+        and branch.dtype == dtype
+        and gate.dtype == dtype
+    ):
+        return None
+    rows = _rows_of(hyper_input)
+    return branch.reshape(rows, hidden), gate.reshape(rows, hc)
+
+
+def _kernel_write_norm(
+    module, flat, branch, gate, rows, hc, hidden, dtype, precise=True
+):
     width = hc * hidden
     return _kernel(
-        "omlx_qwen4_hc_prefill_write_norm",
+        "omlx_qwen4_hc_prefill_write_norm"
+        if precise
+        else "omlx_qwen4_hc_fused_write_norm",
         ["x", "branch", "gate", "w", "eps"],
         ["y_out", "xn"],
-        _WN_SOURCE,
+        _WN_SOURCE if precise else _WND_SOURCE,
     )(
         inputs=[flat, branch, gate, module.hc_norm.weight, _eps_array(module)],
         template=[("T", dtype), ("K", width), ("H", hidden), ("HC", hc)],
@@ -519,7 +561,8 @@ def prefill_forward(module, hyper_input, write=None):
     """Prefill with the fused stream norm and tail/inject epilogue; None on failure.
 
     ``write`` is a pending ``(branch, gate)`` residual write onto ``hyper_input``.
-    The norm kernel applies it and returns the written stream as the passthrough.
+    The norm kernel applies it and returns the written stream as the passthrough;
+    a module without inject weights then returns ``(mixed, written)``.
     """
     global _FAILURE_LOGGED
     try:
@@ -531,24 +574,11 @@ def prefill_forward(module, hyper_input, write=None):
         if write is None:
             normed = _kernel_norm(module, flat, rows, hc, hidden, dtype, precise=True)
         else:
-            branch, gate = write
-            lead = hyper_input.shape[:-1]
-            if not (
-                branch.shape == (*lead, hidden)
-                and gate.shape == (*lead, hc)
-                and branch.dtype == dtype
-                and gate.dtype == dtype
-            ):
+            operands = _write_operands(hyper_input, write, hidden, hc)
+            if operands is None:
                 return None
             written, normed = _kernel_write_norm(
-                module,
-                flat,
-                branch.reshape(rows, hidden),
-                gate.reshape(rows, hc),
-                rows,
-                hc,
-                hidden,
-                dtype,
+                module, flat, *operands, rows, hc, hidden, dtype
             )
             hyper_input = written.reshape(hyper_input.shape)
         normed = normed.reshape(hyper_input.shape)
@@ -602,7 +632,7 @@ def prefill_forward(module, hyper_input, write=None):
             mx.eval(mixed) if injection is None else mx.eval(mixed, injection)
             _VALIDATED.add(signature)
         if injection is None:
-            return mixed
+            return mixed if write is None else (mixed, hyper_input)
         return mixed, hyper_input, injection
     except Exception as exc:  # noqa: BLE001 - optional native path
         if not _FAILURE_LOGGED:
@@ -615,8 +645,14 @@ def prefill_forward(module, hyper_input, write=None):
         return None
 
 
-def fused_forward(module, hyper_input):
-    """Return fused outputs, or None on construction or first-evaluation failure."""
+def fused_forward(module, hyper_input, write=None):
+    """Return fused outputs, or None on construction or first-evaluation failure.
+
+    ``write`` is a pending ``(branch, gate)`` residual write onto ``hyper_input``,
+    applied inside the norm kernel as in :func:`prefill_forward`; the written
+    stream is the passthrough, and a module without inject weights returns
+    ``(mixed, written)``.
+    """
     global _FAILURE_LOGGED
     try:
         hc, hidden, lowrank = module.hc_count, module.hidden_size, module.hc_lowrank
@@ -627,7 +663,16 @@ def fused_forward(module, hyper_input):
         inject = module.block_inject_weight if "block_inject_weight" in module else None
         flat = hyper_input.reshape(rows, width)
         dtype = hyper_input.dtype
-        normed = _kernel_norm(module, flat, rows, hc, hidden, dtype)
+        if write is None:
+            normed = _kernel_norm(module, flat, rows, hc, hidden, dtype)
+        else:
+            operands = _write_operands(hyper_input, write, hidden, hc)
+            if operands is None:
+                return None
+            written, normed = _kernel_write_norm(
+                module, flat, *operands, rows, hc, hidden, dtype, precise=False
+            )
+            hyper_input = written.reshape(hyper_input.shape)
         if inject is not None:
             inject_tensors = (inject.weight, inject.scales, inject.biases)
         else:
@@ -686,6 +731,7 @@ def fused_forward(module, hyper_input):
             down.bits,
             up.bits,
             inject.bits if inject is not None else None,
+            write is not None,
         )
         if signature not in _VALIDATED:
             # Metal compilation is lazy. Validate once, without synchronizing
@@ -697,7 +743,7 @@ def fused_forward(module, hyper_input):
             _VALIDATED.add(signature)
         mixed = mixed.reshape(batch, seq, hidden)
         if inject is None:
-            return mixed
+            return mixed if write is None else (mixed, hyper_input)
         return mixed, hyper_input, injection.reshape(batch, seq, hc)
     except Exception as exc:  # noqa: BLE001 - optional native path
         if not _FAILURE_LOGGED:
@@ -710,4 +756,12 @@ def fused_forward(module, hyper_input):
         return None
 
 
-__all__ = ["MAX_ROWS", "compatible", "enabled", "fused_forward", "prefill_compatible", "prefill_forward"]
+__all__ = [
+    "MAX_ROWS",
+    "compatible",
+    "enabled",
+    "fused_forward",
+    "prefill_compatible",
+    "prefill_forward",
+    "write_enabled",
+]

@@ -271,6 +271,7 @@ def test_kill_switch_disables_fused_path(monkeypatch):
     reloaded = importlib.reload(hc_fused)
     try:
         assert not reloaded.enabled()
+        assert not reloaded.write_enabled()
         assert not reloaded.compatible(
             _module(4), mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16)
         )
@@ -384,23 +385,54 @@ def test_prefill_path_matches_canonical(bits, rows, use_combine, monkeypatch):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_prefill_pending_write_matches_eager_write():
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize(
+    "shape", [(1, 1), (1, 2), (1, 3), (1, 4), (2, 2), (1, 16), (1, 17), (1, 2048)]
+)
+@pytest.mark.parametrize("use_combine", [True, False])
+def test_pending_write_matches_eager_write(bits, shape, use_combine):
+    """The write-norm kernels store the eager residual bit for bit and normalize the same bits."""
     from mlx_vlm.models.qwen4_exp import hc_fused, language
 
-    mx.random.seed(11)
-    rows = hc_fused.MAX_ROWS + 1
-    module = _module(4)
-    hyper = mx.random.normal((1, rows, WIDTH)).astype(mx.bfloat16)
-    branch = mx.random.normal((1, rows, HIDDEN)).astype(mx.bfloat16)
-    gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
+    mx.random.seed(11 + 31 * bits + 7 * shape[0] + shape[1])
+    module = _module(bits, use_combine)
+    hyper = (mx.random.normal((*shape, WIDTH)) * 2).astype(mx.bfloat16)
+    branch = mx.random.normal((*shape, HIDDEN)).astype(mx.bfloat16)
+    gate = (2 * mx.sigmoid(mx.random.normal((*shape, HC)))).astype(mx.bfloat16)
     written = language._hc_write(hyper, branch, gate)
-    expected = hc_fused.prefill_forward(module, written)
-    actual = hc_fused.prefill_forward(module, hyper, (branch, gate))
-    mx.eval(expected, actual)
+    decode = shape[0] * shape[1] <= hc_fused.MAX_ROWS
+    forward = hc_fused.fused_forward if decode else hc_fused.prefill_forward
+    expected = forward(module, written)
+    actual = forward(module, hyper, (branch, gate))
+    expected = (
+        (expected[0], written, expected[2]) if use_combine else (expected, written)
+    )
+    assert actual is not None and len(actual) == len(expected)
+    mx.eval(actual, expected)
     for observed, reference in zip(actual, expected):
+        assert observed.shape == reference.shape
         assert mx.array_equal(
             observed.view(mx.uint16), reference.view(mx.uint16)
         ).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [2, 64])
+def test_promoting_pending_write_falls_back_to_eager_write(rows):
+    # An FP32 branch promotes the eager write; the BF16 kernels must not take it.
+    from mlx_vlm.models.qwen4_exp import language
+
+    mx.random.seed(rows)
+    module = _module(6)
+    hyper = mx.random.normal((1, rows, WIDTH)).astype(mx.bfloat16)
+    branch = mx.random.normal((1, rows, HIDDEN))
+    gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
+    expected = module(language._hc_write(hyper, branch, gate))
+    actual = module(hyper, write=(branch, gate))
+    mx.eval(actual, expected)
+    assert actual[1].dtype == mx.float32
+    for observed, reference in zip(actual, expected):
+        assert mx.array_equal(observed, reference).item()
 
 
 def test_prefill_path_not_offered_for_fused_rows():
