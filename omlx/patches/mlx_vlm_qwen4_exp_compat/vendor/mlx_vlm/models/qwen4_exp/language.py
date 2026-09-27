@@ -1953,12 +1953,19 @@ class Qwen4ExpGatedResidual(nn.Module):
         self, hyper_input: mx.array, target_verify: bool = False, write=None
     ):
         # ``write`` is a pending (branch, gate) residual write onto hyper_input.
+        # The written residual comes back as the passthrough; the mixer (no
+        # block_inject_weight) then returns (mixed, written).
         if write is not None:
-            if not target_verify and hc_fused.prefill_compatible(self, hyper_input):
+            fused = None
+            if hc_fused.write_enabled() and hc_fused.compatible(self, hyper_input):
+                fused = hc_fused.fused_forward(self, hyper_input, write)
+            elif not target_verify and hc_fused.prefill_compatible(self, hyper_input):
                 fused = hc_fused.prefill_forward(self, hyper_input, write)
-                if fused is not None:
-                    return fused
+            if fused is not None:
+                return fused
             hyper_input = _hc_write(hyper_input, *write)
+            out = self(hyper_input, target_verify=target_verify)
+            return out if "block_inject_weight" in self else (out, hyper_input)
         if hc_fused.compatible(self, hyper_input):
             fused = hc_fused.fused_forward(self, hyper_input)
             if fused is not None:
@@ -3222,8 +3229,17 @@ class Qwen4ExpDecoderLayer(nn.Module):
         position_ids: Optional[mx.array],
         gdn_sink=None,
         target_verify: bool = False,
+        write=None,
+        defer_write: bool = False,
     ):
+        """``write`` is the previous layer's pending (branch, gate) residual
+        write onto ``hidden_states``. ``defer_write`` returns this layer's own
+        pending write as ``(residual, branch, gate)`` instead of applying it."""
         if "ple" in self:
+            if write is not None:
+                # The PLE block reads the full residual.
+                hidden_states = _hc_write(hidden_states, *write)
+                write = None
             hidden_states = hidden_states + self.ple(
                 hidden_states,
                 input_ids,
@@ -3235,6 +3251,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mixed, hyper_input, injection_weights = self.attn_hyper_connection(
             hidden_states,
             target_verify=target_verify,
+            write=write,
         )
         if self.is_linear:
             branch = (
@@ -3260,6 +3277,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             if target_verify
             else self.mlp(mixed)
         )
+        if defer_write:
+            return hyper_input, branch, injection_weights
         return _hc_write(hyper_input, branch, injection_weights)
 
 
@@ -3310,6 +3329,12 @@ class Qwen4ExpModel(nn.Module):
             ssm_mask = mask
 
         capture = set(capture_layer_ids or [])
+        target_verify = gdn_sink is not None
+        # Each layer's tail residual write stays pending and is applied inside
+        # the next hyper-connection norm; ``hidden_states`` is the residual
+        # before it (OMLX_QWEN4_HC_FUSED_WRITE=0 applies it eagerly).
+        defer_write = hc_fused.write_enabled()
+        write = None
         for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             layer_mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
@@ -3319,21 +3344,36 @@ class Qwen4ExpModel(nn.Module):
                 cache=layer_cache,
                 position_ids=position_ids,
                 gdn_sink=gdn_sink,
-                target_verify=gdn_sink is not None,
+                target_verify=target_verify,
+                write=write,
+                defer_write=defer_write,
             )
+            if defer_write:
+                hidden_states, write = hidden_states[0], hidden_states[1:]
             if (
                 _EAGER_DISPATCH
                 and hidden_states.shape[0] * hidden_states.shape[1]
                 <= _EAGER_DISPATCH_MAX_ROWS
             ):
-                mx.async_eval(hidden_states)
+                mx.async_eval(hidden_states, *(write or ()))
             if hidden_sink is not None and index in capture:
-                hidden_sink.append(
-                    self.hyper_connection_mixer(
-                        hidden_states,
-                        target_verify=gdn_sink is not None,
+                if write is None:
+                    mixed = self.hyper_connection_mixer(
+                        hidden_states, target_verify=target_verify
                     )
-                )
+                else:
+                    mixed, hidden_states = self.hyper_connection_mixer(
+                        hidden_states, target_verify=target_verify, write=write
+                    )
+                    write = None
+                hidden_sink.append(mixed)
+
+        mixed = None
+        if write is not None:
+            # The final mixer applies the last write and returns the residual.
+            mixed, hidden_states = self.hyper_connection_mixer(
+                hidden_states, target_verify=target_verify, write=write
+            )
 
         if inputs_embeds is None and gdn_sink is None:
             host_ref = getattr(self, "_omlx_mtp_prime_host", None)
@@ -3354,10 +3394,11 @@ class Qwen4ExpModel(nn.Module):
             # mixer. Ordinary layer captures retain their mixed representation.
             hidden_sink.append(hidden_states)
 
-        return self.hyper_connection_mixer(
-            hidden_states,
-            target_verify=gdn_sink is not None,
-        )
+        if mixed is None:
+            mixed = self.hyper_connection_mixer(
+                hidden_states, target_verify=target_verify
+            )
+        return mixed
 
 
 class Qwen4ExpMTPModule(nn.Module):
@@ -3467,6 +3508,8 @@ class Qwen4ExpMTPModule(nn.Module):
         positions = mx.maximum(mx.array(offset), 0).reshape(-1, 1)
         positions = positions + mx.arange(hidden_states.shape[1])[None]
         position_ids = mx.broadcast_to(positions, hidden_states.shape[:2])
+        defer_write = hc_fused.write_enabled()
+        write = None
         for layer, layer_cache in zip(self.layers, cache):
             hidden_states = layer(
                 hidden_states,
@@ -3474,7 +3517,14 @@ class Qwen4ExpMTPModule(nn.Module):
                 mask=mask,
                 cache=layer_cache,
                 position_ids=position_ids,
+                write=write,
+                defer_write=defer_write,
             )
+            if defer_write:
+                hidden_states, write = hidden_states[0], hidden_states[1:]
+        if write is not None:
+            # The mixer applies the last write and returns (mixed, residual).
+            return self.hyper_connection_mixer(hidden_states, write=write)
         return self.hyper_connection_mixer(hidden_states), hidden_states
 
 
