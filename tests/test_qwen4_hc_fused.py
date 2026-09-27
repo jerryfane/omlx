@@ -262,6 +262,14 @@ def test_compatible_fails_closed():
     del module.input_inject_weight
     module.input_mix_weight_down = nn.Linear(WIDTH, LOWRANK, bias=False)
     assert not hc_fused.compatible(module, ok)
+    # The layout verdict is cached per module; replacing a weight tensor must re-check it.
+    module = _module(4)
+    if mx.metal.is_available():
+        assert hc_fused.compatible(module, ok)
+    module.input_mix_weight_up.scales = module.input_mix_weight_up.scales.astype(
+        mx.float16
+    )
+    assert not hc_fused.compatible(module, ok)
 
 
 def test_kill_switch_disables_fused_path(monkeypatch):

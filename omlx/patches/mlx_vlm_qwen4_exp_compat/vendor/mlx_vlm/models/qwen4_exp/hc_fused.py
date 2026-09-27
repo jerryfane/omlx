@@ -444,6 +444,33 @@ def prefill_compatible(module, hyper_input) -> bool:
 
 
 def _layout_compatible(module, hyper_input) -> bool:
+    if not _static_layout_compatible(module):
+        return False
+    if hyper_input.shape[2] != module.hc_count * module.hidden_size:
+        return _ineligible(f"input width {hyper_input.shape[2]}")
+    return mx.default_device() == mx.gpu and mx.metal.is_available()
+
+
+def _static_layout_compatible(module) -> bool:
+    """Cached per module; any reassigned child, weight, scale or bias re-checks.
+
+    The cache keeps those objects alive so their ids cannot be reused while cached.
+    """
+    refs = []
+    for value in dict.values(module):
+        refs.append(value)
+        if isinstance(value, nn.Module):
+            refs.extend(dict.values(value))
+    ids = tuple(map(id, refs))
+    cached = module.__dict__.get("_omlx_hc_layout")
+    if cached is not None and cached[1] == ids:
+        return cached[2]
+    ok = _check_static_layout(module)
+    module.__dict__["_omlx_hc_layout"] = (refs, ids, ok)
+    return ok
+
+
+def _check_static_layout(module) -> bool:
     if hasattr(module, "input_inject_weight"):
         return _ineligible("combined input projection layout")
     hc_count = getattr(module, "hc_count", None)
@@ -457,7 +484,6 @@ def _layout_compatible(module, hyper_input) -> bool:
         # The up grid and quantization groups require 64-element alignment.
         and hidden % 64 == 0
         and lowrank % 64 == 0
-        and hyper_input.shape[2] == hc_count * hidden
     ):
         return _ineligible(
             f"geometry hidden_size={hidden} hc_lowrank={lowrank} hc_count={hc_count}"
@@ -482,7 +508,7 @@ def _layout_compatible(module, hyper_input) -> bool:
         module.block_inject_weight
     ):
         return _ineligible("block_inject_weight quantisation")
-    return mx.default_device() == mx.gpu and mx.metal.is_available()
+    return True
 
 
 def _eps_array(module) -> mx.array:
