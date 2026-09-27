@@ -243,8 +243,8 @@ def test_experts_past_the_bound_view_are_read_from_the_stacked_weights():
 def test_tied_router_logits_route_like_the_served_block():
     """Duplicated router rows give exactly tied probabilities; ties must pick
     the same experts, in the same order, with the same scores as the served
-    softmax + top-k launches."""
-    from omlx.patches.qwen35_moe_router import softmax_topk_row
+    router launches."""
+    from omlx.patches.qwen35_moe_router import router_logits_row, softmax_topk_row
 
     block = _block(1024, 320, bits=5, experts=512)
     rows = block.gate.weight[:64]
@@ -252,7 +252,9 @@ def test_tied_router_logits_route_like_the_served_block():
     mx.eval(block.gate.weight)
     for step in range(8):
         x = (mx.random.normal((1, 1, 1024)) * (0.5 + step)).astype(mx.bfloat16)
-        assert softmax_topk_row(block.gate(x), 10) is not None  # the fold engages
+        # Both router launches engage: the gemv and the softmax + top-k.
+        assert router_logits_row(x, block.gate.weight) is not None
+        assert softmax_topk_row(block.gate(x), 10) is not None
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
 

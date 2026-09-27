@@ -26,8 +26,10 @@ same arithmetic in two launches after the router:
    ``sigmoid(shared_gate) * shared``.
 
 The router ahead of them (gate linear, precise softmax, fused top-k) runs
-its softmax and top-k as one launch (``qwen35_moe_router.softmax_topk_row``)
-where the expert count allows.
+the gate linear as MLX's one-row gemv spread over one simdgroup per expert
+(``qwen35_moe_router.router_gemv``; MLX's own launch has 32 threadgroups)
+and its softmax and top-k as one launch
+(``qwen35_moe_router.softmax_topk_row``) where the shapes allow.
 
 The result is bit-identical to the composed path. The quantized dot products
 reuse the MLX 0.32.2 transcription in ``moe_verify_gather`` (4, 5, 6 and
@@ -426,6 +428,7 @@ class _Plan(NamedTuple):
     down_threadgroup: tuple
     shared_gate_up_operands: tuple = ()  # gate_proj, up_proj, gate (fold)
     shared_down_operands: tuple = ()  # down_proj (fold)
+    router_logits: object = None  # qwen35_moe_router.router_gemv launcher
 
 
 def _shared_formats(block, hidden: int):
@@ -495,6 +498,12 @@ def _build_plan(block) -> _Plan | None:
     gate_up_operands = tuple(view(gate_up[k]) for k in ("weight", "scales", "biases"))
     down_operands = tuple(view(down[k]) for k in ("weight", "scales", "biases"))
     shared = _shared_formats(block, hidden) if _SHARED_FOLD else None
+    gate = block.get("gate")
+    router_logits = None
+    if type(gate) is nn.Linear and "bias" not in gate and gate["weight"].shape[-1] == hidden:
+        from .qwen35_moe_router import router_gemv
+
+        router_logits = router_gemv(gate["weight"])
     rows = _GATE_UP_ROWS * _GATE_UP_SIMDGROUPS
     gate_up_template = [
         ("T", mx.bfloat16),
@@ -512,6 +521,7 @@ def _build_plan(block) -> _Plan | None:
     if shared is None:
         return _Plan(
             hidden=hidden,
+            router_logits=router_logits,
             fold=False,
             gate_up_kernel=_gate_up_kernel(gu_fmt, None, None),
             gate_up_operands=gate_up_operands,
@@ -527,6 +537,7 @@ def _build_plan(block) -> _Plan | None:
     width, sgu_fmt, sd_fmt, g_fmt, shared_gate_up, shared_down = shared
     return _Plan(
         hidden=hidden,
+        router_logits=router_logits,
         fold=True,
         gate_up_kernel=_gate_up_kernel(gu_fmt, sgu_fmt, g_fmt),
         gate_up_operands=gate_up_operands,
@@ -623,7 +634,10 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
             shared_gate = self["shared_expert_gate"](x)
             if shared.dtype != x.dtype or shared_gate.dtype != x.dtype:
                 return orig_call(self, x)
-        logits = self["gate"](x)
+        if plan.router_logits is not None:
+            logits = plan.router_logits(x)
+        else:
+            logits = self["gate"](x)
         routing = softmax_topk_row(logits, self.top_k)
         if routing is None:
             routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), self.top_k)

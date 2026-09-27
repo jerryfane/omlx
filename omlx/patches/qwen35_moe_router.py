@@ -29,6 +29,13 @@ single-row block softmax (its per-simdgroup partial maxima and sums and
 their order) and then selects exactly as ``fused_router_topk`` does, so
 indices and scores are bit-identical to the two launches.
 OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD=0 keeps the two launches.
+
+``router_gemv`` runs the bias-free bf16 gate linear of one row with MLX's
+one-row gemv arithmetic (per-lane column order, shuffle-down tree) but one
+simdgroup per expert instead of MLX's four experts per simdgroup on 32
+threadgroups, so the logits are bit-identical and the 2.6 MB weight read
+spreads over the whole GPU. OMLX_QWEN35_MOE_ROUTER_GEMV=0 keeps
+``nn.Linear``.
 """
 
 from __future__ import annotations
@@ -248,6 +255,112 @@ def fused_router_topk(probs, top_k: int):
         output_dtypes=[mx.uint32, gates.dtype],
     )
     return inds, scores
+
+
+_GEMV_DISABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTER_GEMV", "1") == "0"
+_GEMV_KERNEL = None
+_GEMV_ROWS = 1  # rows per simdgroup
+_GEMV_SIMDGROUPS = 4
+
+# MLX 0.32.2 gemv for ``x @ W.T`` with W [N, K] row-major (the kernel MLX
+# picks for one row when 64 < K < 16 * N: BN 1, SM 1, SN 32, TN 4). Lane l
+# accumulates columns l * 4 + 128 * i for i ascending, each product of the
+# T weight and the float input added in tn order, then MLX's
+# simd_shuffle_down tree leaves the row sum in lane 0. Rows are independent
+# (MLX's TM rows per simdgroup only share the input loads), so any number
+# of rows per simdgroup gives the same bits.
+_GEMV_ROWS_HEADER = """
+template <typename T, int K, int R>
+METAL_FUNC void omlx_router_gemv_rows(
+    const device T* mat, const device T* x, uint lane, thread float* result) {
+  for (int r = 0; r < R; r++) {
+    result[r] = 0;
+  }
+  for (int i = 0; i < K / 128; i++) {
+    const int bn = int(lane) * 4 + i * 128;
+    float v_coeff[4];
+    for (int tn = 0; tn < 4; tn++) {
+      v_coeff[tn] = static_cast<float>(x[bn + tn]);
+    }
+    for (int r = 0; r < R; r++) {
+      T inter[4];
+      for (int tn = 0; tn < 4; tn++) {
+        inter[tn] = mat[r * K + bn + tn];
+      }
+      for (int tn = 0; tn < 4; tn++) {
+        result[r] += inter[tn] * v_coeff[tn];
+      }
+    }
+  }
+  for (int r = 0; r < R; r++) {
+    for (ushort sn = 16; sn >= 1; sn >>= 1) {
+      result[r] += simd_shuffle_down(result[r], sn);
+    }
+  }
+}
+"""
+
+_GEMV_SOURCE = """
+    const uint lane = thread_index_in_simdgroup;
+    const int row0 = (int(threadgroup_position_in_grid.y) * NSG +
+                      int(simdgroup_index_in_threadgroup)) * R;
+    float result[R];
+    omlx_router_gemv_rows<T, K, R>(w + size_t(row0) * K, x, lane, result);
+    if (lane == 0) {
+      for (int r = 0; r < R; r++) {
+        y[row0 + r] = static_cast<T>(result[r]);
+      }
+    }
+"""
+
+
+def router_gemv(weight):
+    """A launcher for ``x @ weight.T`` (a bias-free bf16 ``nn.Linear``) on
+    one bf16 row of width K, or None outside the layout it reproduces.
+
+    It runs MLX's one-row gemv arithmetic with one simdgroup per row (MLX
+    runs four rows per simdgroup on N / 16 threadgroups). The layout is
+    that gemv's: 64 < K < 16 * N and K % 128 == 0 (no guarded tail).
+    OMLX_QWEN35_MOE_ROUTER_GEMV=0 returns None.
+    """
+    global _GEMV_KERNEL
+    if _GEMV_DISABLED or weight.ndim != 2 or weight.dtype != mx.bfloat16:
+        return None
+    n, k = weight.shape
+    if not 64 < k < 16 * n or k % 128 or n % (_GEMV_ROWS * _GEMV_SIMDGROUPS):
+        return None
+    if _GEMV_KERNEL is None:
+        _GEMV_KERNEL = mx.fast.metal_kernel(
+            name="omlx_qwen35_moe_router_gemv_row",
+            input_names=["x", "w"],
+            output_names=["y"],
+            header=_GEMV_ROWS_HEADER,
+            source=_GEMV_SOURCE,
+        )
+    kernel = _GEMV_KERNEL
+    template = [("T", mx.bfloat16), ("K", k), ("R", _GEMV_ROWS), ("NSG", _GEMV_SIMDGROUPS)]
+    grid = (32, n // _GEMV_ROWS, 1)
+    threadgroup = (32, _GEMV_SIMDGROUPS, 1)
+
+    def launch(x):
+        return kernel(
+            inputs=[x, weight],
+            template=template,
+            grid=grid,
+            threadgroup=threadgroup,
+            output_shapes=[(*x.shape[:-1], n)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+
+    return launch
+
+
+def router_logits_row(x, weight):
+    """``x @ weight.T`` through ``router_gemv`` for one bf16 row, or None."""
+    if x.size != x.shape[-1] or x.shape[-1] != weight.shape[-1] or x.dtype != mx.bfloat16:
+        return None
+    launch = router_gemv(weight)
+    return None if launch is None else launch(x)
 
 
 def softmax_topk_row(logits, top_k: int):

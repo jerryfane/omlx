@@ -309,3 +309,55 @@ def test_softmax_topk_row_declines_layouts_it_does_not_reproduce():
     assert softmax_topk_row(mx.zeros((1, 1, 320), mx.bfloat16), 10) is None
     assert softmax_topk_row(mx.zeros((1, 2, 512), mx.bfloat16), 10) is None
     assert softmax_topk_row(mx.zeros((1, 1, 512), mx.float16), 10) is None
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("experts,width", [(512, 2560), (256, 2048), (128, 1024)])
+def test_router_gemv_matches_mlx_linear(experts, width):
+    """BF16 logits and, because rounding hides one-ulp FP32 differences (a
+    simd_sum in place of MLX's shuffle-down tree changes only a few BF16
+    logits), the FP32 row sums against MLX's gemv on the same values in FP32."""
+    from omlx.patches import qwen35_moe_router as router
+
+    probe = mx.fast.metal_kernel(
+        name="test_router_gemv_probe",
+        input_names=["x", "w"],
+        output_names=["y"],
+        header=router._GEMV_ROWS_HEADER,
+        source="""
+        const uint lane = thread_index_in_simdgroup;
+        const int row = int(threadgroup_position_in_grid.y) * 4 + int(simdgroup_index_in_threadgroup);
+        float result[1];
+        omlx_router_gemv_rows<T, K, 1>(w + size_t(row) * K, x, lane, result);
+        if (lane == 0) {
+          y[row] = result[0];
+        }
+        """,
+    )
+    for seed in range(12):
+        mx.random.seed(seed)
+        weight = (mx.random.normal((experts, width)) * 0.02 * (1 + seed % 4)).astype(mx.bfloat16)
+        x = (mx.random.normal((1, 1, width)) * (1 + seed % 3)).astype(mx.bfloat16)
+        out = router.router_logits_row(x, weight)
+        assert mx.array_equal(out.view(mx.uint16), (x @ weight.T).view(mx.uint16)).item()
+        sums = probe(
+            inputs=[x, weight],
+            template=[("T", mx.bfloat16), ("K", width)],
+            grid=(32, experts, 1),
+            threadgroup=(32, 4, 1),
+            output_shapes=[(experts,)],
+            output_dtypes=[mx.float32],
+        )[0]
+        ref = (x.astype(mx.float32) @ weight.astype(mx.float32).T).reshape(experts)
+        assert mx.array_equal(sums.view(mx.uint32), ref.view(mx.uint32)).item()
+
+
+def test_router_gemv_declines_layouts_mlx_reduces_differently():
+    from omlx.patches.qwen35_moe_router import router_logits_row
+
+    x = mx.zeros((1, 1, 2048), mx.bfloat16)
+    # K >= 16 * N: MLX splits K over eight simdgroups.
+    assert router_logits_row(x, mx.zeros((128, 2048), mx.bfloat16)) is None
+    # K % 128: MLX's guarded tail block.
+    assert router_logits_row(x[..., :2000], mx.zeros((512, 2000), mx.bfloat16)) is None
+    assert router_logits_row(x.astype(mx.float16), mx.zeros((512, 2048), mx.float16)) is None
