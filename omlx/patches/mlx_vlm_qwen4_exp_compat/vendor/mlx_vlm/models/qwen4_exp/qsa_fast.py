@@ -82,22 +82,24 @@ def _native_causal_query_chunk(key_tokens: int) -> int:
     return 1024
 
 
-# One-row decode mask of the official (masked SDPA) arm: the indexer picks the
-# top block_topk complete blocks by score, and the causal tail stays visible.
-# MLX builds that from the per-head scores with maximum/sum/divide, an
-# argsort-backed argpartition and ~20 small mask ops. This kernel scores the
-# blocks with the same float operations in the same order, selects exactly the
-# same set (argpartition's [-k:] is the last k of MLX's stable ascending merge
-# sort: NaN above +inf, -0 == +0, ties by index) and writes the token mask in
-# one launch. OMLX_QWEN4_QSA_DECODE_SELECT=0 keeps the MLX ops.
+# One decode row's QSA block selection. The indexer picks the top block_topk
+# complete blocks by score and the causal tail stays visible; the official
+# (masked SDPA) arm widens that to a token mask, the gathered arm to the sorted
+# token list it gathers. MLX builds either from the per-head scores with
+# maximum/sum/divide, an argsort-backed argpartition (plus a sort) and a dozen
+# to twenty small ops. This kernel scores the blocks with the same float
+# operations in the same order, selects exactly the same set (argpartition's
+# [-k:] is the last k of MLX's stable ascending merge sort: NaN above +inf,
+# -0 == +0, ties by index) and writes the mask or token list in one launch.
+# OMLX_QWEN4_QSA_DECODE_SELECT=0 keeps the MLX ops.
 _DECODE_SELECT_DISABLED = os.environ.get(
     "OMLX_QWEN4_QSA_DECODE_SELECT", "1"
 ).strip().lower() in {"0", "false", "no", "off"}
 _DECODE_SELECT_THREADS = 1024
 # Keys held per thread; larger block banks keep the MLX ops.
 _DECODE_SELECT_MAX_PER_THREAD = 32
-_DECODE_SELECT_KERNEL = None
-_DECODE_SELECT_VALIDATED: set[tuple[int, ...]] = set()
+_DECODE_SELECT_KERNELS: dict[str, object] = {}
+_DECODE_SELECT_VALIDATED: set[tuple] = set()
 _DECODE_SELECT_DIVISORS: dict[int, mx.array] = {}
 
 _DECODE_SELECT_HEADER = r"""
@@ -193,6 +195,9 @@ _DECODE_SELECT_SOURCE = r"""
     const uint threshold = prefix;
     const uint skip =
         atomic_load_explicit(&hist[threshold & 255u], memory_order_relaxed) - remaining;
+"""
+
+_DECODE_SELECT_MASK_EPILOGUE = r"""
     if (skip == 0) {
         for (uint j = 0; j < PER; ++j) {
             const uint e = j * TG + tid;
@@ -239,6 +244,135 @@ _DECODE_SELECT_SOURCE = r"""
     }
 """
 
+_DECODE_SELECT_TOKENS_EPILOGUE = r"""
+    // Winning blocks in increasing index order, each widened to its R tokens,
+    // then the tail tokens: prefix counts over chunks of TG blocks rank the
+    // ties (as above) and place the winners.
+    threadgroup uint sg_hits[TG / 32];
+    uint tie_carry = 0;
+    uint hit_carry = 0;
+    for (uint j = 0; j < PER; ++j) {
+        const uint e = j * TG + tid;
+        const uint tie = (e < n && keys[j] == threshold) ? 1u : 0u;
+        const uint tie_rank = simd_prefix_exclusive_sum(tie);
+        const uint simd_ties = simd_sum(tie);
+        if (lane == 0) {
+            sg_ties[sg] = simd_ties;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint tie_before = 0;
+        uint tie_chunk = 0;
+        for (uint s = 0; s < TG / 32; ++s) {
+            const uint v = sg_ties[s];
+            tie_before += s < sg ? v : 0u;
+            tie_chunk += v;
+        }
+        const uint hit = (e < n && (keys[j] > threshold
+            || (tie && tie_carry + tie_before + tie_rank >= skip))) ? 1u : 0u;
+        const uint hit_rank = simd_prefix_exclusive_sum(hit);
+        const uint simd_hits = simd_sum(hit);
+        if (lane == 0) {
+            sg_hits[sg] = simd_hits;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint hit_before = 0;
+        uint hit_chunk = 0;
+        for (uint s = 0; s < TG / 32; ++s) {
+            const uint v = sg_hits[s];
+            hit_before += s < sg ? v : 0u;
+            hit_chunk += v;
+        }
+        if (hit) {
+            const uint slot = (hit_carry + hit_before + hit_rank) * R;
+            for (uint r = 0; r < R; ++r) {
+                tokens[slot + r] = int(e * R + r);
+            }
+        }
+        tie_carry += tie_chunk;
+        hit_carry += hit_chunk;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid < TAIL) {
+        tokens[K * R + tid] = int(n * R + tid);
+    }
+"""
+
+
+def _decode_block_selection(
+    head_scores: mx.array,
+    head_dim: int,
+    key_tokens: int,
+    compress_ratio: int,
+    block_topk: int,
+    tokens: bool,
+) -> mx.array | None:
+    global _DECODE_SELECT_DISABLED
+    if _DECODE_SELECT_DISABLED:
+        return None
+    blocks = int(head_scores.shape[-1])
+    tail = key_tokens - blocks * compress_ratio
+    if (
+        head_scores.ndim != 4
+        or head_scores.shape[0] != 1
+        or 1 not in head_scores.shape[1:3]
+        or head_scores.dtype != mx.float32
+        or compress_ratio <= 0
+        or not 0 <= tail < compress_ratio
+        or not 0 < block_topk < blocks
+    ):
+        return None
+    per_thread = 8
+    while per_thread * _DECODE_SELECT_THREADS < blocks:
+        per_thread *= 2
+    if per_thread > _DECODE_SELECT_MAX_PER_THREAD:
+        return None
+    heads = int(head_scores.shape[1] * head_scores.shape[2])
+    output = "tokens" if tokens else "mask"
+    try:
+        kernel = _DECODE_SELECT_KERNELS.get(output)
+        if kernel is None:
+            kernel = mx.fast.metal_kernel(
+                name=f"omlx_qwen4_qsa_decode_select_{output}",
+                input_names=["head_scores", "divisor"],
+                output_names=[output],
+                header=_DECODE_SELECT_HEADER,
+                source=_DECODE_SELECT_SOURCE
+                + (_DECODE_SELECT_TOKENS_EPILOGUE if tokens else _DECODE_SELECT_MASK_EPILOGUE),
+                ensure_row_contiguous=True,
+            )
+            _DECODE_SELECT_KERNELS[output] = kernel
+        divisor = _DECODE_SELECT_DIVISORS.get(head_dim)
+        if divisor is None:
+            # The FP32 value MLX makes of the Python float in `scores / sqrt(d)`.
+            divisor = mx.array([math.sqrt(head_dim)], dtype=mx.float32)
+            mx.eval(divisor)
+            _DECODE_SELECT_DIVISORS[head_dim] = divisor
+        result = kernel(
+            inputs=[head_scores, divisor],
+            template=[
+                ("H", heads),
+                ("K", block_topk),
+                ("R", compress_ratio),
+                ("TAIL", tail),
+                ("PER", per_thread),
+            ],
+            grid=(_DECODE_SELECT_THREADS, 1, 1),
+            threadgroup=(_DECODE_SELECT_THREADS, 1, 1),
+            output_shapes=[
+                (1, block_topk * compress_ratio + tail) if tokens else (1, 1, 1, key_tokens)
+            ],
+            output_dtypes=[mx.int32 if tokens else mx.bool_],
+        )[0]
+        signature = (output, heads, block_topk, compress_ratio, tail, per_thread)
+        if signature not in _DECODE_SELECT_VALIDATED:
+            # Surface a pipeline failure while the MLX ops can still take over.
+            mx.eval(result)
+            _DECODE_SELECT_VALIDATED.add(signature)
+        return result
+    except Exception:
+        _DECODE_SELECT_DISABLED = True
+        return None
+
 
 def decode_block_selection_mask(
     head_scores: mx.array,
@@ -259,66 +393,27 @@ def decode_block_selection_mask(
     the caller then keeps the MLX ops.
     """
 
-    global _DECODE_SELECT_DISABLED, _DECODE_SELECT_KERNEL
-    if _DECODE_SELECT_DISABLED:
-        return None
-    blocks = int(head_scores.shape[-1])
-    tail = key_tokens - blocks * compress_ratio
-    if (
-        head_scores.ndim != 4
-        or head_scores.shape[0] != 1
-        or head_scores.shape[2] != 1
-        or head_scores.dtype != mx.float32
-        or compress_ratio <= 0
-        or not 0 <= tail < compress_ratio
-        or not 0 < block_topk < blocks
-    ):
-        return None
-    per_thread = 8
-    while per_thread * _DECODE_SELECT_THREADS < blocks:
-        per_thread *= 2
-    if per_thread > _DECODE_SELECT_MAX_PER_THREAD:
-        return None
-    heads = int(head_scores.shape[1])
-    try:
-        if _DECODE_SELECT_KERNEL is None:
-            _DECODE_SELECT_KERNEL = mx.fast.metal_kernel(
-                name="omlx_qwen4_qsa_decode_select_mask",
-                input_names=["head_scores", "divisor"],
-                output_names=["mask"],
-                header=_DECODE_SELECT_HEADER,
-                source=_DECODE_SELECT_SOURCE,
-                ensure_row_contiguous=True,
-            )
-        divisor = _DECODE_SELECT_DIVISORS.get(head_dim)
-        if divisor is None:
-            # The FP32 value MLX makes of the Python float in `scores / sqrt(d)`.
-            divisor = mx.array([math.sqrt(head_dim)], dtype=mx.float32)
-            mx.eval(divisor)
-            _DECODE_SELECT_DIVISORS[head_dim] = divisor
-        mask = _DECODE_SELECT_KERNEL(
-            inputs=[head_scores, divisor],
-            template=[
-                ("H", heads),
-                ("K", block_topk),
-                ("R", compress_ratio),
-                ("TAIL", tail),
-                ("PER", per_thread),
-            ],
-            grid=(_DECODE_SELECT_THREADS, 1, 1),
-            threadgroup=(_DECODE_SELECT_THREADS, 1, 1),
-            output_shapes=[(1, 1, 1, key_tokens)],
-            output_dtypes=[mx.bool_],
-        )[0]
-        signature = (heads, block_topk, compress_ratio, tail, per_thread)
-        if signature not in _DECODE_SELECT_VALIDATED:
-            # Surface a pipeline failure while the MLX ops can still take over.
-            mx.eval(mask)
-            _DECODE_SELECT_VALIDATED.add(signature)
-        return mask
-    except Exception:
-        _DECODE_SELECT_DISABLED = True
-        return None
+    return _decode_block_selection(
+        head_scores, head_dim, key_tokens, compress_ratio, block_topk, tokens=False
+    )
+
+
+def decode_block_selection_tokens(
+    head_scores: mx.array,
+    *,
+    head_dim: int,
+    key_tokens: int,
+    compress_ratio: int,
+    block_topk: int,
+) -> mx.array | None:
+    """Sorted selected token indices ``[1, block_topk * ratio + tail]`` (int32)
+    of one decode row, or None: what the gathered arm builds from its
+    argpartition, with ``head_scores`` ``[1, 1, heads, blocks]`` scored as in
+    :func:`decode_block_selection_mask`."""
+
+    return _decode_block_selection(
+        head_scores, head_dim, key_tokens, compress_ratio, block_topk, tokens=True
+    )
 
 
 # One masked decode row's SDPA on the official arm. MLX runs its two-pass
@@ -627,6 +722,25 @@ def _gather_kv_rows_token_major(kv: mx.array, indices: mx.array) -> mx.array:
     return gathered.transpose(*axes)
 
 
+def _portable_indexer_head_scores(
+    queries: mx.array,
+    pooled_keys: mx.array,
+    head_dim: int,
+) -> mx.array:
+    """FP32 query-head/block products ``[B, T, H, blocks]``."""
+
+    batch, query_tokens, query_heads, _ = queries.shape
+    # Flatten the query-token and index-head axes so MLX emits one FP32 GEMM
+    # for the chunk instead of a broadcasted batch of tiny matmuls.  Each
+    # output dot product and the following head reduction are unchanged.
+    return (
+        queries.astype(mx.float32).reshape(
+            batch, query_tokens * query_heads, head_dim
+        )
+        @ pooled_keys.astype(mx.float32).swapaxes(-1, -2)
+    ).reshape(batch, query_tokens, query_heads, pooled_keys.shape[1])
+
+
 def _portable_indexer_scores(
     queries: mx.array,
     pooled_keys: mx.array,
@@ -634,16 +748,7 @@ def _portable_indexer_scores(
 ) -> mx.array:
     """Current float32 MLX QSA score reference."""
 
-    batch, query_tokens, query_heads, _ = queries.shape
-    # Flatten the query-token and index-head axes so MLX emits one FP32 GEMM
-    # for the chunk instead of a broadcasted batch of tiny matmuls.  Each
-    # output dot product and the following head reduction are unchanged.
-    scores = (
-        queries.astype(mx.float32).reshape(
-            batch, query_tokens * query_heads, head_dim
-        )
-        @ pooled_keys.astype(mx.float32).swapaxes(-1, -2)
-    ).reshape(batch, query_tokens, query_heads, pooled_keys.shape[1])
+    scores = _portable_indexer_head_scores(queries, pooled_keys, head_dim)
     return mx.sum(mx.maximum(scores, 0), axis=-2) / math.sqrt(head_dim)
 
 
@@ -967,32 +1072,47 @@ def contiguous_causal_gathered_qsa_decode(
         compress_ratio=compress_ratio,
         mask_q_offset=key_tokens - 1,
     )
+    selected_tokens = None
     if block_scores is None:
-        block_scores = _portable_indexer_scores(
+        head_scores = _portable_indexer_head_scores(
             index_queries,
             pooled_index_keys,
             indexer_head_dim,
         )
+        if index_queries.shape[1] < _native_topk_min_rows():
+            # The argpartition path below, in one launch (same sorted tokens).
+            selected_tokens = decode_block_selection_tokens(
+                head_scores,
+                head_dim=indexer_head_dim,
+                key_tokens=key_tokens,
+                compress_ratio=compress_ratio,
+                block_topk=block_budget,
+            )
+        if selected_tokens is None:
+            block_scores = mx.sum(mx.maximum(head_scores, 0), axis=-2) / math.sqrt(
+                indexer_head_dim
+            )
 
-    selected_blocks = _native_topk_indices(block_scores, block_budget)
-    if selected_blocks is None:
-        selected_blocks = mx.argpartition(
-            block_scores,
-            kth=-block_budget,
-            axis=-1,
-        )[..., -block_budget:].astype(mx.int32)
-    # Argpartition/native radix order is not chronological.  Sorting the
-    # selected set preserves the official key order for deterministic SDPA.
-    selected_blocks = mx.sort(selected_blocks, axis=-1)
-    selected_tokens = (
-        selected_blocks[..., None] * compress_ratio
-        + mx.arange(compress_ratio, dtype=mx.int32)
-    ).reshape(1, block_budget * compress_ratio)
+    if selected_tokens is None:
+        selected_blocks = _native_topk_indices(block_scores, block_budget)
+        if selected_blocks is None:
+            selected_blocks = mx.argpartition(
+                block_scores,
+                kth=-block_budget,
+                axis=-1,
+            )[..., -block_budget:].astype(mx.int32)
+        # Argpartition/native radix order is not chronological.  Sorting the
+        # selected set preserves the official key order for deterministic SDPA.
+        selected_blocks = mx.sort(selected_blocks, axis=-1)
+        selected_tokens = (
+            selected_blocks[..., None] * compress_ratio
+            + mx.arange(compress_ratio, dtype=mx.int32)
+        ).reshape(1, block_budget * compress_ratio)
 
-    complete_key_len = max_blocks * compress_ratio
-    if complete_key_len < key_tokens:
-        tail = mx.arange(complete_key_len, key_tokens, dtype=mx.int32)[None]
-        selected_tokens = mx.concatenate((selected_tokens, tail), axis=-1)
+        complete_key_len = max_blocks * compress_ratio
+        if complete_key_len < key_tokens:
+            tail = mx.arange(complete_key_len, key_tokens, dtype=mx.int32)[None]
+            selected_tokens = mx.concatenate((selected_tokens, tail), axis=-1)
 
     selected_keys = _gather_kv_rows(keys, selected_tokens)
     selected_values = _gather_kv_rows(values, selected_tokens)

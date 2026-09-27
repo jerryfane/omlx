@@ -323,3 +323,38 @@ def test_masked_decode_sdpa_matches_mlx_bit_for_bit(key_len, kind):
     assert actual is not None
     assert actual.shape == expected.shape and actual.dtype == expected.dtype
     assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16)).item()
+
+
+def _official_gathered_tokens(head_scores: mx.array, key_len: int) -> mx.array:
+    """``contiguous_causal_gathered_qsa_decode``'s argpartition path, verbatim."""
+    blocks = key_len // RATIO
+    scores = mx.sum(mx.maximum(head_scores, 0), axis=-2) / math.sqrt(HEAD_DIM)
+    selected = mx.argpartition(scores, kth=-TOPK, axis=-1)[..., -TOPK:].astype(mx.int32)
+    selected = mx.sort(selected, axis=-1)
+    tokens = (selected[..., None] * RATIO + mx.arange(RATIO, dtype=mx.int32)).reshape(
+        1, TOPK * RATIO
+    )
+    if blocks * RATIO < key_len:
+        tail = mx.arange(blocks * RATIO, key_len, dtype=mx.int32)[None]
+        tokens = mx.concatenate((tokens, tail), axis=-1)
+    return tokens
+
+
+@pytest.mark.parametrize("key_len", [2052, 32770, 65539])
+@pytest.mark.parametrize("kind", ["normal", "cutoff_ties", "specials"])
+def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
+    blocks = key_len // RATIO
+    head_scores = mx.array(_head_scores(blocks, kind, key_len).reshape(1, 1, 4, blocks))
+
+    actual = qsa_fast.decode_block_selection_tokens(
+        head_scores,
+        head_dim=HEAD_DIM,
+        key_tokens=key_len,
+        compress_ratio=RATIO,
+        block_topk=TOPK,
+    )
+    expected = _official_gathered_tokens(head_scores, key_len)
+
+    assert actual is not None
+    assert actual.dtype == expected.dtype and actual.shape == expected.shape
+    assert mx.array_equal(actual, expected).item()
