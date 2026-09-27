@@ -184,11 +184,12 @@ def fused_moe_combine(routed, scores, shared, gate):
     global _COMBINE_KERNEL
     if _COMBINE_DISABLED or routed.ndim < 2:
         return None
-    lead = routed.shape[:-2]
-    top_k, hidden = routed.shape[-2:]
+    shape = routed.shape
+    lead = shape[:-2]
+    top_k, hidden = shape[-2:]
     if not (
         top_k in _COMBINE_TOP_K
-        and all(d == 1 for d in lead)
+        and lead.count(1) == len(lead)
         and scores.shape == (*lead, top_k)
         and shared.shape == (*lead, hidden)
         and gate.shape == (*lead, 1)
@@ -308,11 +309,12 @@ def apply_qwen35_moe_router_patch() -> bool:
         def vlm_patched_call(self, x):
             if not router_eligible(x, self.num_experts):
                 return vlm_orig(self, x)
-            gates = mx.softmax(self.gate(x), axis=-1, precise=True)
+            # Children by item: this runs for every MoE layer of every decode step.
+            gates = mx.softmax(self["gate"](x), axis=-1, precise=True)
             inds, scores = fused_router_topk(gates, self.top_k)
-            y = self.switch_mlp(x, inds)
-            shared_y = self.shared_expert(x)
-            shared_gate = self.shared_expert_gate(x)
+            y = self["switch_mlp"](x, inds)
+            shared_y = self["shared_expert"](x)
+            shared_gate = self["shared_expert_gate"](x)
             combined = fused_moe_combine(y, scores, shared_y, shared_gate)
             if combined is not None:
                 return combined

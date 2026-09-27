@@ -51,10 +51,14 @@ from mlx_vlm.models.switch_layers import (
 
 from ..scheduler import _sync_and_clear_cache
 from . import moe_verify_gather
+from .module_cache import cached_per_module
 
 logger = logging.getLogger(__name__)
 
 _CALL_PATCHED = False
+# Unsorted routed-expert calls (decode) read the fused operands resolved once
+# per SwitchGLU; OMLX_QWEN35_MOE_DECODE_PLAN=0 resolves them per call.
+_DECODE_PLAN_ENABLED = os.environ.get("OMLX_QWEN35_MOE_DECODE_PLAN", "1") != "0"
 
 # Loaded model classes whose module path marks a supported SwitchGLU family:
 # mlx-lm Qwen3.5/3.6 and HyV3, Qwen4-Exp's inherited SwitchGLU, the oMLX
@@ -163,6 +167,68 @@ def _make_patched_call(orig_call):
     return patched
 
 
+def _quantized_operands(linear) -> tuple | None:
+    """``mx.gather_qmm`` operands of an mlx-vlm QuantizedSwitchLinear without bias."""
+    if type(linear) is not VLMQuantizedSwitchLinear or "bias" in linear:
+        return None
+    return (
+        linear["weight"],
+        linear["scales"],
+        linear.get("biases"),
+        linear.group_size,
+        linear.bits,
+        linear.mode,
+    )
+
+
+def _build_decode_plan(switch_mlp) -> tuple | None:
+    # Training decode stops gradients through the routes; keep the stock body.
+    if switch_mlp.training:
+        return None
+    gate_up = _quantized_operands(switch_mlp.get("gate_up_proj"))
+    down = _quantized_operands(switch_mlp.get("down_proj"))
+    activation = switch_mlp.get("activation")
+    if gate_up is None or down is None or activation is None:
+        return None
+    return gate_up, down, activation
+
+
+def _unsorted_switch(plan, x, indices):
+    """The unsorted branch of the fused call on resolved operands.
+
+    Same ops as ``gate_up(x, idx, sorted_indices=False)``, the split, the
+    activation and ``down_proj(..., sorted_indices=False)`` through
+    mlx-vlm's ``QuantizedSwitchLinear.__call__``.
+    """
+    (gw, gs, gb, g_group, g_bits, g_mode), (dw, ds, db, d_group, d_bits, d_mode), act = plan
+    x_gate_up = mx.gather_qmm(
+        mx.expand_dims(x, (-2, -3)),
+        gw,
+        gs,
+        gb,
+        rhs_indices=indices,
+        transpose=True,
+        group_size=g_group,
+        bits=g_bits,
+        mode=g_mode,
+        sorted_indices=False,
+    )
+    x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+    x = mx.gather_qmm(
+        act(x_up, x_gate),
+        dw,
+        ds,
+        db,
+        rhs_indices=indices,
+        transpose=True,
+        group_size=d_group,
+        bits=d_bits,
+        mode=d_mode,
+        sorted_indices=False,
+    )
+    return x.squeeze(-2)
+
+
 def _make_vlm_patched_call(original):
     fused_call = _make_patched_call(original)
 
@@ -175,6 +241,12 @@ def _make_vlm_patched_call(original):
             # The upstream kernel would copy the strided gate/up views.
             routed = _fused_verify_switch(self, x, indices)
             return self._combine(routed, weights, shared, residual)
+        if _DECODE_PLAN_ENABLED and indices.size < 64:
+            # fused_call's unsorted branch (decode rows) with cached operands.
+            plan = cached_per_module(self, "_omlx_gate_up_decode_plan", _build_decode_plan)
+            if plan is not None:
+                routed = _unsorted_switch(plan, x, indices)
+                return self._combine(routed, weights, shared, residual)
         routed = fused_call(self, x, indices)
         return self._combine(routed, weights, shared, residual)
 
