@@ -36,6 +36,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from . import qwen35_gdn_verify_fused
+from .module_cache import cached_per_module
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,9 @@ _QWEN4_PREFILL_KERNELS = None
 _QWEN4_PREFILL_ENGAGED_LOGGED = False
 _QWEN4_PREFILL_ENABLED = os.environ.get("OMLX_QWEN4_GDN_PREFILL_FUSED", "1") != "0"
 _QWEN4_PREFILL_MIN_ROWS = 64
+# The B1/T1 decode resolves its static eligibility and operands once per layer
+# (rebuilt when a weight or child module is replaced); =0 re-derives them per call.
+_QWEN4_DECODE_PLAN_ENABLED = os.environ.get("OMLX_QWEN4_GDN_DECODE_PLAN", "1") != "0"
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -624,8 +628,14 @@ def _qwen4_norm_gate_kernel():
 def qwen4_decode_norm_gate_fused(y, z, norm_w, *, hv, dv, eps):
     """Fuse Qwen4's BF16 RMSNorm + FP32 sigmoid-gate at B1/T1."""
 
+    return _qwen4_norm_gate(y, z, norm_w, mx.array(eps, dtype=mx.float32), hv, dv)
+
+
+def _qwen4_norm_gate(y, z, norm_w, eps, hv, dv):
+    """``qwen4_decode_norm_gate_fused`` with ``eps`` as a float32 scalar array."""
+
     return _qwen4_norm_gate_kernel()(
-        inputs=[y, z, norm_w, mx.array(eps, dtype=mx.float32)],
+        inputs=[y, z, norm_w, eps],
         template=[
             ("T", y.dtype),
             ("HV", hv),
@@ -693,38 +703,39 @@ def _qwen4_gdn_geometry_ok(module) -> bool:
     )
 
 
-def _qwen4_decode_static_eligible(module) -> bool:
+def _canonical_projection(linear, rows, signatures, in_dim=_QWEN4_HIDDEN_SIZE):
+    # The q4 prefill routing reclasses these projections to a QuantizedLinear
+    # subclass; the fused decode reads their packed storage, not their forward.
+    if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "affine":
+        return False
+    signature = (linear.bits, linear.group_size)
+    if signatures is not None and signature not in signatures:
+        return False
+    if signature[0] not in _ALLOWED_BITS or signature[1] not in _ALLOWED_GROUPS:
+        return False
+    bits, group_size = signature
+    if in_dim % group_size:
+        return False
+    packed_cols = in_dim * bits // 32
+    scale_cols = in_dim // group_size
+    return (
+        linear.weight.shape == (rows, packed_cols)
+        and linear.weight.dtype == mx.uint32
+        and linear.scales.shape == (rows, scale_cols)
+        and linear.scales.dtype == mx.bfloat16
+        and linear.biases is not None
+        and linear.biases.shape == (rows, scale_cols)
+        and linear.biases.dtype == mx.bfloat16
+        and "bias" not in linear
+    )
+
+
+def _qwen4_decode_static_check(module) -> bool:
     """Require the supported Qwen4 geometry and canonical affine storage."""
 
     if not _qwen4_gdn_geometry_ok(module):
         return False
     conv_dim = 2 * 16 * 128 + 48 * 128
-
-    # The q4 prefill routing reclasses these projections to a QuantizedLinear
-    # subclass; the fused decode reads their packed storage, not their forward.
-    def canonical_projection(linear, rows, signatures, in_dim=2560):
-        if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "affine":
-            return False
-        signature = (linear.bits, linear.group_size)
-        if signatures is not None and signature not in signatures:
-            return False
-        if signature[0] not in _ALLOWED_BITS or signature[1] not in _ALLOWED_GROUPS:
-            return False
-        bits, group_size = signature
-        if in_dim % group_size:
-            return False
-        packed_cols = in_dim * bits // 32
-        scale_cols = in_dim // group_size
-        return (
-            linear.weight.shape == (rows, packed_cols)
-            and linear.weight.dtype == mx.uint32
-            and linear.scales.shape == (rows, scale_cols)
-            and linear.scales.dtype == mx.bfloat16
-            and linear.biases is not None
-            and linear.biases.shape == (rows, scale_cols)
-            and linear.biases.dtype == mx.bfloat16
-            and "bias" not in linear
-        )
 
     # The shipped oQe allocation is intentionally mixed per tensor.  This
     # kernel begins after those projections, so accept only the exact
@@ -734,7 +745,7 @@ def _qwen4_decode_static_eligible(module) -> bool:
     wide = getattr(module, "_omlx_qwen4_wide_projections", False)
     qkv_signatures = None if wide else {(4, 64), (5, 64), (6, 64)}
     aux_signatures = None if wide else {(5, 128), (6, 64)}
-    if not canonical_projection(
+    if not _canonical_projection(
         module.in_proj_qkv,
         conv_dim,
         qkv_signatures,
@@ -745,7 +756,7 @@ def _qwen4_decode_static_eligible(module) -> bool:
         (module.in_proj_b, 48),
         (module.in_proj_a, 48),
     ):
-        if not canonical_projection(linear, rows, aux_signatures):
+        if not _canonical_projection(linear, rows, aux_signatures):
             return False
 
     out = module.out_proj
@@ -754,7 +765,7 @@ def _qwen4_decode_static_eligible(module) -> bool:
     # checks remain. Its input is the concatenated value stream, not the
     # residual stream.
     out_signatures = None if wide else {(5, 128)}
-    return canonical_projection(
+    return _canonical_projection(
         out,
         _QWEN4_HIDDEN_SIZE,
         out_signatures,
@@ -762,20 +773,118 @@ def _qwen4_decode_static_eligible(module) -> bool:
     )
 
 
-def _qwen4_decode_dynamic_eligible(
-    module,
-    inputs,
-    mask,
-    cache,
-    gdn_sink,
-    target_verify,
-) -> bool:
+def _one_row_fused_projections(linears):
+    """Operands of mlx-vlm's one-row fused in-projection, or None when it keeps four.
+
+    ``_target_verify_linears`` runs one-row bf16 decode through
+    ``_decode_quantized_linears_fused``: one ``quantized_matmul`` over the
+    row-concatenated projections, split back, when all four share bits, group
+    size and mode. This mirrors its gate (the input is always one bf16 row
+    here) and shares its concatenation cache on the first projection.
+    """
+    first = linears[0]
+    if not all(
+        isinstance(linear, nn.QuantizedLinear)
+        and linear.bits == first.bits
+        and linear.group_size == first.group_size
+        and linear.mode == first.mode
+        and linear.biases is not None
+        and linear.scales.dtype == mx.bfloat16
+        and linear.biases.dtype == mx.bfloat16
+        and "bias" not in linear
+        for linear in linears
+    ):
+        return None
+    cache_key = tuple(
+        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
+    )
+    cached = getattr(first, "_fused_decode_linears", None)
+    if cached is None or cached[0] != cache_key:
+        weights = mx.concatenate([linear.weight for linear in linears], axis=0)
+        scales = mx.concatenate([linear.scales for linear in linears], axis=0)
+        biases = mx.concatenate([linear.biases for linear in linears], axis=0)
+        split_indices = []
+        offset = 0
+        for linear in linears[:-1]:
+            offset += linear.weight.shape[0]
+            split_indices.append(offset)
+        mx.eval(weights, scales, biases)
+        cached = (cache_key, weights, scales, biases, split_indices)
+        first._fused_decode_linears = cached
+    _, weights, scales, biases, split_indices = cached
+    return (
+        weights,
+        scales,
+        biases,
+        split_indices,
+        first.group_size,
+        first.bits,
+        first.mode,
+    )
+
+
+def _build_qwen4_decode_plan(module):
+    """Resolved operands of the fused B1/T1 decode, or None when ineligible."""
+    if not _qwen4_decode_static_check(module):
+        return None
+    projections = (
+        module.in_proj_qkv,
+        module.in_proj_z,
+        module.in_proj_b,
+        module.in_proj_a,
+    )
+    return (
+        projections,
+        _one_row_fused_projections(projections),
+        module.conv1d.weight,
+        mx.array(module.head_k_dim**-0.5, dtype=mx.bfloat16),
+        module.A_log,
+        module.dt_bias,
+        module.norm.weight,
+        mx.array(module.norm.eps, dtype=mx.float32),
+        module.out_proj,
+        module.num_k_heads,
+        module.num_v_heads,
+        module.head_k_dim,
+        module.head_v_dim,
+    )
+
+
+_QWEN4_GDN_CLASSES: dict = {}
+
+
+def _qwen4_decode_plan(module):
+    """The cached decode plan of an ``nn.Module`` Qwen4 GDN layer, else None."""
+    cls = type(module)
+    qwen4 = _QWEN4_GDN_CLASSES.get(cls)
+    if qwen4 is None:
+        qwen4 = _QWEN4_GDN_CLASSES[cls] = (
+            issubclass(cls, nn.Module)
+            and cls.__name__ == "Qwen4ExpGatedDeltaNet"
+            and cls.__module__ == "mlx_vlm.models.qwen4_exp.language"
+        )
+    if not qwen4:
+        return None
+    return cached_per_module(
+        module,
+        "_omlx_qwen4_decode_plan",
+        _build_qwen4_decode_plan,
+        flags=(module.__dict__.get("_omlx_qwen4_wide_projections", False),),
+    )
+
+
+def _qwen4_decode_static_eligible(module) -> bool:
+    """Require the supported Qwen4 geometry and canonical affine storage."""
+
+    if _QWEN4_DECODE_PLAN_ENABLED and isinstance(module, nn.Module):
+        return _qwen4_decode_plan(module) is not None
+    return _qwen4_decode_static_check(module)
+
+
+def _qwen4_decode_state_eligible(inputs, cache) -> bool:
+    """One bf16 row against a canonical, unpadded conv and recurrent state."""
     if (
-        target_verify
-        or gdn_sink is not None
-        or mask is not None
-        or cache is None
-        or not isinstance(inputs, mx.array)
+        not isinstance(inputs, mx.array)
         or inputs.shape != (1, 1, 2560)
         or inputs.dtype != mx.bfloat16
         or getattr(cache, "lengths", None) is not None
@@ -791,6 +900,23 @@ def _qwen4_decode_dynamic_eligible(
         and isinstance(recurrent_state, mx.array)
         and recurrent_state.shape == (1, 48, 128, 128)
         and recurrent_state.dtype == mx.float32
+    )
+
+
+def _qwen4_decode_dynamic_eligible(
+    module,
+    inputs,
+    mask,
+    cache,
+    gdn_sink,
+    target_verify,
+) -> bool:
+    return (
+        not target_verify
+        and gdn_sink is None
+        and mask is None
+        and cache is not None
+        and _qwen4_decode_state_eligible(inputs, cache)
         and _qwen4_decode_static_eligible(module)
     )
 
@@ -872,11 +998,69 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         for dtype in (mx.float16, mx.bfloat16)
     }
 
+    def qwen4_decode(self, plan, inputs, cache):
+        """The fused B1/T1 decode on a cached plan (same launches as below)."""
+        (
+            projections,
+            fused,
+            conv_w,
+            q_scale,
+            A_log,
+            dt_bias,
+            norm_w,
+            eps,
+            out_proj,
+            hk,
+            hv,
+            dk,
+            dv,
+        ) = plan
+        if fused is None:
+            mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
+        else:
+            weights, w_scales, w_biases, split_indices, group_size, bits, mode = fused
+            mixed_qkv, z, b, a = mx.split(
+                mx.quantized_matmul(
+                    inputs,
+                    weights,
+                    scales=w_scales,
+                    biases=w_biases,
+                    transpose=True,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                ),
+                split_indices,
+                axis=-1,
+            )
+        q, k, v, conv_state, g, beta = qwen4_decode_prework_fused(
+            mixed_qkv, cache[0], conv_w, q_scale, b, a, A_log, dt_bias, hk, hv, dk, dv
+        )
+        out, state = _qwen4_decode_recurrence(q, k, v, g, beta, cache[1])
+        result = out_proj(_qwen4_norm_gate(out, z, norm_w, eps, hv, dv))
+        cache[0], cache[1] = conv_state, state
+        if hasattr(cache, "advance"):
+            cache.advance(1)
+            q35._qwen3_5_advance_left_padding_info(cache, 1)
+            q35._qwen3_5_advance_lengths_info(cache, 1)
+        global _QWEN4_DECODE_ENGAGED_LOGGED
+        if not _QWEN4_DECODE_ENGAGED_LOGGED:
+            _QWEN4_DECODE_ENGAGED_LOGGED = True
+            logger.info("Qwen4 fused B1/T1 GDN decode prework and norm-gate engaged")
+        return result
+
     def decode(self, inputs, mask=None, cache=None, **kwargs):
         # Runtime extensions (for example capture/verification keywords)
         # must keep their original implementation and cache semantics.
         if kwargs:
             return original(self, inputs, mask=mask, cache=cache, **kwargs)
+        # Qwen4 B1/T1 decode first: its one-row input is below the prefill
+        # floor and its class is not Qwen3_5GatedDeltaNet, so the two gates
+        # below could not claim it.
+        if _QWEN4_DECODE_PLAN_ENABLED and mask is None and cache is not None:
+            plan = _qwen4_decode_plan(self)
+            if plan is not None and _qwen4_decode_state_eligible(inputs, cache):
+                return qwen4_decode(self, plan, inputs, cache)
         if _qwen4_prefill_eligible(self, inputs, mask, cache):
             return _qwen4_prefill(self, inputs, cache)
         if _qwen35_decode_eligible(self, inputs, mask, cache):

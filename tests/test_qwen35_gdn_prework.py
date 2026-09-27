@@ -1015,3 +1015,170 @@ def test_qwen4_decode_setting_is_captured_per_model(monkeypatch):
     )
     assert not prework_mod._qwen4_decode_static_eligible(reloaded)
     assert prework_mod._qwen4_decode_static_eligible(module)
+
+
+def _bits(array):
+    return array.view(mx.uint32 if array.dtype == mx.float32 else mx.uint16)
+
+
+def _random_projection(input_dims, output_dims, bits, group_size):
+    weight = (mx.random.normal((output_dims, input_dims)) * 0.05).astype(mx.bfloat16)
+    linear = nn.QuantizedLinear(
+        input_dims, output_dims, bias=False, group_size=group_size, bits=bits
+    )
+    linear.weight, linear.scales, linear.biases = mx.quantize(
+        weight, group_size=group_size, bits=bits, mode="affine"
+    )
+    return linear
+
+
+def _real_qwen4_decode_module(signatures, seed):
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpGatedDeltaNet,
+        Qwen4ExpRMSNormGated,
+    )
+
+    mx.random.seed(seed)
+    module = Qwen4ExpGatedDeltaNet.__new__(Qwen4ExpGatedDeltaNet)
+    nn.Module.__init__(module)
+    module.num_k_heads, module.num_v_heads = HK, HV
+    module.head_k_dim, module.head_v_dim = DK, DV
+    module.conv_kernel_size = 4
+    module.conv1d = nn.Conv1d(C, C, 4, groups=C, bias=False)
+    module.conv1d.weight = (mx.random.normal((C, 4, 1)) * 0.3).astype(mx.bfloat16)
+    module.norm = Qwen4ExpRMSNormGated(DV, eps=1e-6, activation="sigmoid")
+    module.norm.weight = (1 + mx.random.normal((DV,)) * 0.1).astype(mx.bfloat16)
+    module.A_log = (mx.random.normal((HV,)) * 0.5).astype(mx.bfloat16)
+    module.dt_bias = (mx.random.normal((HV,)) * 0.5).astype(mx.bfloat16)
+    for name, rows, (bits, group) in zip(
+        ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
+        (C, HV * DV, HV, HV),
+        signatures,
+    ):
+        setattr(module, name, _random_projection(2560, rows, bits, group))
+    module.out_proj = _random_projection(HV * DV, 2560, 5, 128)
+    module.eval()
+    mx.eval(module.parameters())
+    return module
+
+
+def _decode_steps(module, inputs, conv_state, recurrent_state):
+    from mlx_vlm.models.cache import ArraysCache
+
+    cache = ArraysCache(size=2)
+    cache[0], cache[1] = conv_state, recurrent_state
+    outputs = []
+    for x in inputs:
+        outputs.append(module(x, cache=cache))
+        mx.eval(outputs[-1], cache[0], cache[1])
+    return outputs, (cache[0], cache[1])
+
+
+def _assert_planned_decode_matches_per_call_path(monkeypatch, module, steps, seed):
+    mx.random.seed(seed)
+    inputs = [
+        (mx.random.normal((1, 1, 2560)) * 0.5).astype(mx.bfloat16) for _ in range(steps)
+    ]
+    conv_state = (mx.random.normal((1, 3, C)) * 0.5).astype(mx.bfloat16)
+    recurrent_state = mx.random.normal((1, HV, DV, DK)) * 0.01
+    monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_PLAN_ENABLED", False)
+    expected, expected_state = _decode_steps(
+        module, inputs, conv_state, recurrent_state
+    )
+    monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_PLAN_ENABLED", True)
+    actual, actual_state = _decode_steps(module, inputs, conv_state, recurrent_state)
+    for want, got in zip(
+        (*expected, *expected_state), (*actual, *actual_state), strict=True
+    ):
+        assert want.dtype == got.dtype and want.shape == got.shape
+        assert mx.array_equal(_bits(want), _bits(got)).item()
+
+
+@pytest.fixture
+def patched_decode(monkeypatch):
+    def stock(*args, **kwargs):
+        raise AssertionError("eligible Qwen4 decode unexpectedly fell back")
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    monkeypatch.setattr(language.Qwen3_5GatedDeltaNet, "__call__", stock)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize(
+    "signatures",
+    [
+        ((6, 64), (6, 64), (6, 64), (6, 64)),  # one fused in-projection launch
+        ((4, 64), (5, 128), (5, 128), (5, 128)),  # four projection launches
+    ],
+)
+@pytest.mark.parametrize("seed", [3, 11])
+def test_qwen4_planned_decode_is_bit_identical_to_per_call_path(
+    monkeypatch, patched_decode, signatures, seed
+):
+    module = _real_qwen4_decode_module(signatures, seed)
+    _assert_planned_decode_matches_per_call_path(monkeypatch, module, 3, seed)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_qwen4_decode_plan_follows_replaced_weights_and_modules(
+    monkeypatch, patched_decode
+):
+    module = _real_qwen4_decode_module(((6, 64),) * 4, 5)
+    _assert_planned_decode_matches_per_call_path(monkeypatch, module, 1, 5)
+    # A projection with another allocation turns the fused in-projection into four.
+    module.in_proj_z = _random_projection(2560, HV * DV, 5, 128)
+    _assert_planned_decode_matches_per_call_path(monkeypatch, module, 1, 6)
+    # New tensors on the same modules.
+    module.in_proj_qkv.weight = mx.random.randint(
+        0, 2**32 - 1, module.in_proj_qkv.weight.shape, dtype=mx.uint32
+    )
+    module.conv1d.weight = (mx.random.normal((C, 4, 1)) * 0.3).astype(mx.bfloat16)
+    module.A_log = (mx.random.normal((HV,)) * 0.5).astype(mx.bfloat16)
+    module.norm.weight = (1 + mx.random.normal((DV,)) * 0.1).astype(mx.bfloat16)
+    module.out_proj = _random_projection(HV * DV, 2560, 5, 128)
+    _assert_planned_decode_matches_per_call_path(monkeypatch, module, 1, 7)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_qwen4_decode_plan_turns_ineligible_on_replacement(monkeypatch):
+    fallbacks = []
+
+    def stock(self, inputs, mask=None, cache=None):
+        fallbacks.append(inputs.shape)
+        return inputs
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    monkeypatch.setattr(language.Qwen3_5GatedDeltaNet, "__call__", stock)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    module = _real_qwen4_decode_module(((6, 64),) * 4, 9)
+    _decode_steps(
+        module,
+        [mx.zeros((1, 1, 2560), dtype=mx.bfloat16)],
+        mx.zeros((1, 3, C), dtype=mx.bfloat16),
+        mx.zeros((1, HV, DV, DK)),
+    )
+    assert not fallbacks
+    # 8-bit in-projections are outside the shipped allocation allow-list.
+    module.in_proj_qkv = _random_projection(2560, C, 8, 64)
+    _decode_steps(
+        module,
+        [mx.zeros((1, 1, 2560), dtype=mx.bfloat16)],
+        mx.zeros((1, 3, C), dtype=mx.bfloat16),
+        mx.zeros((1, HV, DV, DK)),
+    )
+    assert fallbacks == [(1, 1, 2560)]
+    # ...until the model opts in to wide projections.
+    prework_mod.configure_qwen4_decode(
+        SimpleNamespace(modules=lambda: [module]), wide_projections=True
+    )
+    _decode_steps(
+        module,
+        [mx.zeros((1, 1, 2560), dtype=mx.bfloat16)],
+        mx.zeros((1, 3, C), dtype=mx.bfloat16),
+        mx.zeros((1, HV, DV, DK)),
+    )
+    assert fallbacks == [(1, 1, 2560)]
