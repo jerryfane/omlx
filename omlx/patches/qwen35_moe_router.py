@@ -18,11 +18,16 @@ ulp; the routed expert set never differs.
 
 Only short rows route here (decode and spec-verify widths); prefill keeps
 the composed chain, whose cost amortizes over the chunk.
+
+One-row decode also folds the combine ``(y * scores).sum(-2) +
+sigmoid(shared_gate) * shared`` (five launches) into one bit-identical launch;
+OMLX_QWEN35_MOE_COMBINE_FUSED=0 keeps the composed ops.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from functools import wraps
 
 import mlx.core as mx
@@ -32,6 +37,12 @@ logger = logging.getLogger(__name__)
 _KERNEL = None
 _ENGAGED_LOGGED = False
 _MAX_ROWS = 8
+_COMBINE_KERNEL = None
+_COMBINE_DISABLED = os.environ.get(
+    "OMLX_QWEN35_MOE_COMBINE_FUSED", "1"
+).strip().lower() in {"0", "false", "no", "off"}
+# Top-k widths whose k-sum order was checked against mlx's reduction.
+_COMBINE_TOP_K = (8, 10)
 
 _SOURCE = """
     // One threadgroup (a single simdgroup) per row; each lane owns
@@ -130,6 +141,75 @@ def fused_router_topk(probs, top_k: int):
         output_dtypes=[mx.uint32, gates.dtype],
     )
     return inds, scores
+
+
+# Matches the composed ops bit for bit: each product, sum step, sigmoid step
+# and the final multiply/add round to T like mlx's kernels. The k-sum follows
+# mlx col_reduce_small for one row: lane l (of 8) folds rows l, l + 8, ...
+# onto +0, then lanes 1..7 are added onto lane 0 in order. mx.sigmoid is
+# 1 / (1 + exp(|x|)) (1 - that for x >= 0) with mlx's non-fast-math exp.
+_COMBINE_SOURCE = """
+    const uint h = thread_position_in_grid.x;
+    if (h >= uint(H)) return;
+    const device T* rp = routed + h;
+    T lane[8];
+    for (int l = 0; l < 8; ++l) {
+        lane[l] = T(0.0f);
+    }
+    for (int j = 0; j < K; ++j) {
+        const T p = T(float(rp[j * H]) * float(scores[j]));
+        lane[j % 8] = T(float(p) + float(lane[j % 8]));
+    }
+    T acc = lane[0];
+    for (int l = 1; l < 8; ++l) {
+        acc = T(float(lane[l]) + float(acc));
+    }
+    const float g = float(gate[0]);
+    const T e = T(1.0f + float(T(metal::precise::exp(metal::abs(g)))));
+    const T y = T(metal::precise::divide(1.0f, float(e)));
+    const T s = g < 0.0f ? y : T(1.0f - float(y));
+    const T sh = T(float(s) * float(shared[h]));
+    out[h] = T(float(acc) + float(sh));
+"""
+
+
+def fused_moe_combine(routed, scores, shared, gate):
+    """``(routed * scores[..., None]).sum(-2) + mx.sigmoid(gate) * shared`` in one launch.
+
+    One row only: ``routed`` [..., k, H], ``scores`` [..., k], ``shared``
+    [..., H], ``gate`` [..., 1], all bf16, k in _COMBINE_TOP_K. Each row is
+    reduced in mlx's one-row col_reduce_small order. Returns None when the
+    operands are outside that layout or the kill switch is set.
+    """
+    global _COMBINE_KERNEL
+    if _COMBINE_DISABLED or routed.ndim < 2:
+        return None
+    lead = routed.shape[:-2]
+    top_k, hidden = routed.shape[-2:]
+    if not (
+        top_k in _COMBINE_TOP_K
+        and all(d == 1 for d in lead)
+        and scores.shape == (*lead, top_k)
+        and shared.shape == (*lead, hidden)
+        and gate.shape == (*lead, 1)
+        and routed.dtype == scores.dtype == shared.dtype == gate.dtype == mx.bfloat16
+    ):
+        return None
+    if _COMBINE_KERNEL is None:
+        _COMBINE_KERNEL = mx.fast.metal_kernel(
+            name="omlx_qwen35_moe_combine_row",
+            input_names=["routed", "scores", "shared", "gate"],
+            output_names=["out"],
+            source=_COMBINE_SOURCE,
+        )
+    return _COMBINE_KERNEL(
+        inputs=[routed, scores, shared, gate],
+        template=[("T", mx.bfloat16), ("K", top_k), ("H", hidden)],
+        grid=(hidden, 1, 1),
+        threadgroup=(min(256, hidden), 1, 1),
+        output_shapes=[(*lead, hidden)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
 
 
 def router_eligible(x, num_experts: int) -> bool:
@@ -231,9 +311,13 @@ def apply_qwen35_moe_router_patch() -> bool:
             gates = mx.softmax(self.gate(x), axis=-1, precise=True)
             inds, scores = fused_router_topk(gates, self.top_k)
             y = self.switch_mlp(x, inds)
-            y = (y * scores[..., None]).sum(axis=-2)
             shared_y = self.shared_expert(x)
-            shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+            shared_gate = self.shared_expert_gate(x)
+            combined = fused_moe_combine(y, scores, shared_y, shared_gate)
+            if combined is not None:
+                return combined
+            y = (y * scores[..., None]).sum(axis=-2)
+            shared_y = mx.sigmoid(shared_gate) * shared_y
             return y + shared_y
 
         vcls.__call__ = vlm_patched_call
