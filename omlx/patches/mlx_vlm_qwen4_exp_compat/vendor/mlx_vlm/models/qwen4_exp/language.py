@@ -3253,12 +3253,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
         """``write`` is the previous layer's pending (branch, gate) residual
         write onto ``hidden_states``. ``defer_write`` returns this layer's own
         pending write as ``(residual, branch, gate)`` instead of applying it."""
+        # Children by item (one dict lookup, not nn.Module.__getattr__):
+        # this runs for every layer of every decode step.
         if "ple" in self:
             if write is not None:
                 # The PLE block reads the full residual.
                 hidden_states = _hc_write(hidden_states, *write)
                 write = None
-            hidden_states = hidden_states + self.ple(
+            hidden_states = hidden_states + self["ple"](
                 hidden_states,
                 input_ids,
                 cache,
@@ -3266,35 +3268,33 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 target_verify=target_verify,
             )
 
-        mixed, hyper_input, injection_weights = self.attn_hyper_connection(
+        mixed, hyper_input, injection_weights = self["attn_hyper_connection"](
             hidden_states,
             target_verify=target_verify,
             write=write,
         )
         if self.is_linear:
+            linear_attn = self["linear_attn"]
             branch = (
-                _VERIFIER._gated_delta(self.linear_attn, mixed, mask, cache)
+                _VERIFIER._gated_delta(linear_attn, mixed, mask, cache)
                 if target_verify
-                else self.linear_attn(mixed, mask=mask, cache=cache)
+                else linear_attn(mixed, mask=mask, cache=cache)
             )
         else:
-            branch = self.self_attn(
+            branch = self["self_attn"](
                 mixed,
                 mask=mask,
                 cache=cache,
                 position_ids=position_ids,
                 target_verify=target_verify,
             )
-        mixed, hyper_input, injection_weights = self.mlp_hyper_connection(
+        mixed, hyper_input, injection_weights = self["mlp_hyper_connection"](
             hyper_input,
             target_verify=target_verify,
             write=(branch, injection_weights),
         )
-        branch = (
-            _VERIFIER._feed_forward(self.mlp, mixed)
-            if target_verify
-            else self.mlp(mixed)
-        )
+        mlp = self["mlp"]
+        branch = _VERIFIER._feed_forward(mlp, mixed) if target_verify else mlp(mixed)
         if defer_write:
             return hyper_input, branch, injection_weights
         return _hc_write(hyper_input, branch, injection_weights)
@@ -3352,6 +3352,12 @@ class Qwen4ExpModel(nn.Module):
         # the next hyper-connection norm; ``hidden_states`` is the residual
         # before it (OMLX_QWEN4_HC_FUSED_WRITE=0 applies it eagerly).
         defer_write = hc_fused.write_enabled()
+        # Every layer keeps the residual's leading (batch, rows) dims.
+        eager = (
+            _EAGER_DISPATCH
+            and hidden_states.shape[0] * hidden_states.shape[1]
+            <= _EAGER_DISPATCH_MAX_ROWS
+        )
         write = None
         for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             layer_mask = ssm_mask if layer.is_linear else fa_mask
@@ -3368,14 +3374,8 @@ class Qwen4ExpModel(nn.Module):
             )
             if defer_write:
                 hidden_states, write = hidden_states[0], hidden_states[1:]
-            if (
-                _EAGER_DISPATCH
-                and (
-                    index < _EAGER_DISPATCH_WARMUP
-                    or index % _EAGER_DISPATCH_EVERY == 0
-                )
-                and hidden_states.shape[0] * hidden_states.shape[1]
-                <= _EAGER_DISPATCH_MAX_ROWS
+            if eager and (
+                index < _EAGER_DISPATCH_WARMUP or index % _EAGER_DISPATCH_EVERY == 0
             ):
                 mx.async_eval(hidden_states, *(write or ()))
             if hidden_sink is not None and index in capture:
