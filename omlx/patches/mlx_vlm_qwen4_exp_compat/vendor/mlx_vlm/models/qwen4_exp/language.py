@@ -2262,6 +2262,11 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 rotary.dim,
                 3 if position_ids is None else position_ids.ndim,
             )
+            # The grouped launch reads quantized weights; dense projections keep the MLX ops.
+            and all(
+                isinstance(proj, nn.QuantizedLinear)
+                for proj in (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj)
+            )
             and row_exact_qmv._group_plan(
                 (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj),
                 x,
