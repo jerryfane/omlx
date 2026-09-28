@@ -3909,6 +3909,22 @@ def test_draft_distribution_matches_request_sampling(settings):
     assert bg._resolve_draft_sampler(row, state) is draft
 
 
+def test_greedy_verify_targets_match_the_serial_greedy_sampler():
+    """Two bf16 logits one ulp apart (3.0 at id 100, 2.984375 at id 5) below
+    half the logsumexp round to one log-probability; serial greedy decoding
+    then picks the lower id, and a verify row must pick the same token."""
+    from omlx.utils.sampling import make_sampler
+
+    row = mx.full((1, 4096), 2.0, dtype=mx.bfloat16)
+    row[0, 5] = 2.984375
+    row[0, 100] = 3.0
+    rows = mx.concatenate([row, row[:, ::-1]])
+    serial = mx.concatenate([make_sampler(temp=0.0)(bg._logprobs(r[None])) for r in rows])
+    targets = bg._greedy_targets(rows, bg._logprobs(rows))
+    assert serial.tolist() == [5, 4095 - 100]
+    assert targets.tolist() == serial.tolist()
+
+
 def test_stochastic_acceptance_preserves_target_marginal():
     from omlx.utils.sampling import make_sampler
 
