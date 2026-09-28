@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -835,6 +836,16 @@ class Glm5NextSparseAttention(nn.Module):
         return output
 
 
+@partial(mx.compile, shapeless=True)
+def _clamped_swiglu(x_up: mx.array, x_gate: mx.array, limit: float) -> mx.array:
+    # One fused elementwise kernel instead of clip/clip/silu/multiply passes
+    # over the expert activations; the same ops in the same dtypes, so the
+    # result is bit-identical to the eager chain.
+    x_gate = mx.clip(x_gate, a_min=None, a_max=limit)
+    x_up = mx.clip(x_up, a_min=-limit, a_max=limit)
+    return nn.silu(x_gate) * x_up
+
+
 class Glm5NextClampedSwiGLU(nn.Module):
     def __init__(self, limit: Optional[float]):
         super().__init__()
@@ -842,8 +853,7 @@ class Glm5NextClampedSwiGLU(nn.Module):
 
     def __call__(self, x_up: mx.array, x_gate: mx.array) -> mx.array:
         if self.limit is not None:
-            x_gate = mx.clip(x_gate, a_min=None, a_max=self.limit)
-            x_up = mx.clip(x_up, a_min=-self.limit, a_max=self.limit)
+            return _clamped_swiglu(x_up, x_gate, float(self.limit))
         return nn.silu(x_gate) * x_up
 
 
@@ -860,8 +870,9 @@ class Glm5NextMLP(nn.Module):
         gate = linear_forward(self.gate_proj, x)
         up = linear_forward(self.up_proj, x)
         if self.limit is not None:
-            gate = mx.clip(gate, a_min=None, a_max=self.limit)
-            up = mx.clip(up, a_min=-self.limit, a_max=self.limit)
+            return linear_forward(
+                self.down_proj, _clamped_swiglu(up, gate, float(self.limit))
+            )
         return linear_forward(self.down_proj, nn.silu(gate) * up)
 
 

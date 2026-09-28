@@ -288,11 +288,9 @@ def test_qwen4_decode_prework_is_bit_exact_including_fp32_gate():
     b = (mx.random.normal((1, 1, HV)) * 0.2).astype(mx.bfloat16)
     A_log = (mx.random.normal((HV,)) * 0.2).astype(mx.bfloat16)
     dt_bias = (mx.random.normal((HV,)) * 0.2).astype(mx.bfloat16)
-    inv = DK**-0.5
-    q_scale = mx.array(inv * inv, dtype=mx.bfloat16)
-    k_scale = mx.array(inv, dtype=mx.bfloat16)
+    q_scale = mx.array(DK**-0.5, dtype=mx.bfloat16)
 
-    q, k, v, next_state = _composed(qkv, state, conv1d)
+    q, k, v, next_state = _composed_l2(qkv, state, conv1d)
     g, beta = _compute_g_beta(A_log, a, b, dt_bias)
     reference = (q, k, v, next_state, g, beta)
     actual = qwen4_decode_prework_fused(
@@ -300,7 +298,6 @@ def test_qwen4_decode_prework_is_bit_exact_including_fp32_gate():
         state,
         conv_w,
         q_scale,
-        k_scale,
         b,
         a,
         A_log,
@@ -318,6 +315,34 @@ def test_qwen4_decode_prework_is_bit_exact_including_fp32_gate():
     ):
         assert expected.dtype == observed.dtype, name
         assert mx.array_equal(expected, observed).item(), name
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("seq", [1, 2, 3, 4])
+def test_qwen4_verify_prework_rows_equal_serial_decode_steps(seq):
+    """Lightning MTP verify rows must reproduce the fused decode step per token."""
+    mx.random.seed(53 + seq)
+    conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(mx.bfloat16)
+    qkv = (mx.random.normal((1, seq, C)) * 0.5).astype(mx.bfloat16)
+    state = (mx.random.normal((1, 3, C)) * 0.5).astype(mx.bfloat16)
+    a = (mx.random.normal((1, 1, HV)) * 0.2).astype(mx.bfloat16)
+    b = (mx.random.normal((1, 1, HV)) * 0.2).astype(mx.bfloat16)
+    A_log = (mx.random.normal((HV,)) * 0.2).astype(mx.bfloat16)
+    dt_bias = (mx.random.normal((HV,)) * 0.2).astype(mx.bfloat16)
+    q_scale = mx.array(DK**-0.5, dtype=mx.bfloat16)
+
+    verify = gdn_prework_fused(
+        qkv, state, conv_w, q_scale, mx.array(1.0, dtype=mx.bfloat16), HK, HV, DK, DV, l2=True
+    )
+    serial_state = state
+    for row in range(seq):
+        q, k, v, serial_state, _, _ = qwen4_decode_prework_fused(
+            qkv[:, row : row + 1], serial_state, conv_w, q_scale, b, a, A_log, dt_bias,
+            HK, HV, DK, DV,
+        )
+        for name, step, window in zip(("q", "k", "v"), (q, k, v), verify[:3]):
+            assert mx.array_equal(step[:, 0], window[:, row]).item(), f"{name} row {row}"
+    assert mx.array_equal(serial_state, verify[3]).item()
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")

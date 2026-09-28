@@ -3,17 +3,22 @@
 
 Decode (at most 16 BF16 rows) fuses per-stream RMS norm, down/inject
 projections with activation, and the up projection with stream mixing.
-Prefill keeps the down/up projections on the MLX matmul path and fuses the
-stream norm, silu(down / HC), and the mixing/inject epilogue. Both need four
-streams and affine group-size-64 projections with 4/5/6/8-bit weights. FP32
-epilogues can round differently from the canonical BF16 operations.
+Prefill fuses the stream norm, silu(down / HC), and the mixing/inject
+epilogue around the down/up projections; on GPUs with tensor units (M5) those
+projections run in hc_prefill_nax's kernels with the epilogues folded in
+(bit-identical to the MLX matmul path), elsewhere on MLX's quantized matmul.
+Both need four streams and affine group-size-64 projections with 4/5/6/8-bit
+weights. FP32 epilogues can round differently from the canonical BF16
+operations.
 
 A pending residual write (previous block's branch times its injection gate)
 can be applied inside the stream norm, which also stores the written
 residual; it rounds exactly like the eager multiply and add.
 
 Each kernel specialization is evaluated once to catch lazy compilation errors.
-Failures only fall back for the current call; later evaluation errors propagate.
+A failure falls back for the current call only; the NAX prefill projections
+instead fall back to MLX for the process after a failure or a bitwise
+mismatch on first use. Later evaluation errors propagate.
 Disable with OMLX_QWEN4_HC_FUSED=0. OMLX_QWEN4_HC_FUSED_WRITE=0 keeps the
 decode residual writes eager and stops deferring each layer's tail write into
 the next hyper-connection norm.
@@ -22,26 +27,25 @@ the next hyper-connection norm.
 from __future__ import annotations
 
 import logging
-import os
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .hc_projection import _HEADER
+from . import hc_prefill_nax
+from .hc_projection import _HEADER, env_enabled
 
 logger = logging.getLogger(__name__)
 
 MAX_ROWS = 16
 _GROUP_SIZE = 64
 _SUPPORTED_BITS = (4, 5, 6, 8)
-
-
-def _env_disabled(name: str) -> bool:
-    return os.environ.get(name, "1").strip().lower() in {"0", "false", "no", "off"}
-
-
-_DISABLED = _env_disabled("OMLX_QWEN4_HC_FUSED")
-_WRITE_DISABLED = _env_disabled("OMLX_QWEN4_HC_FUSED_WRITE")
+_DISABLED = not env_enabled("OMLX_QWEN4_HC_FUSED")
+_WRITE_DISABLED = not env_enabled("OMLX_QWEN4_HC_FUSED_WRITE")
+# Prefill rows on the tensor units (hc_prefill_nax): three dispatches instead of
+# six, bit-identical. Disable with OMLX_QWEN4_HC_NAX_PREFILL=0.
+_NAX_DISABLED = not env_enabled("OMLX_QWEN4_HC_NAX_PREFILL")
+_NAX_AVAILABLE: bool | None = None
+_NAX_BROKEN = False
 _KERNELS: dict[str, object] = {}
 _VALIDATED: set[tuple] = set()
 _FAILURE_LOGGED = False
@@ -659,12 +663,116 @@ def _tail(hc: int, hidden: int):
     return fn
 
 
-def prefill_forward(module, hyper_input, write=None):
+def _nax_available() -> bool:
+    global _NAX_AVAILABLE
+    if _NAX_AVAILABLE is None:
+        try:
+            from omlx.custom_kernels.nax import is_nax_available
+
+            _NAX_AVAILABLE = bool(is_nax_available())
+        except Exception:  # noqa: BLE001 - no tensor units: keep MLX's kernels
+            _NAX_AVAILABLE = False
+    return _NAX_AVAILABLE
+
+
+def _nax_prefill_ok(module, rows: int, width: int, inject) -> bool:
+    """Whether the tensor-unit kernels reproduce this call bit for bit.
+
+    They repeat MLX's unsplit NAX quantized matmul, so the up projection must
+    take that kernel in MLX too, and the inject partials need the tail
+    kernel's whole-pack thread slices.
+    """
+    return (
+        not _NAX_DISABLED
+        and not _NAX_BROKEN
+        and inject is not None
+        and width % (256 * _pack_factor(inject.bits)) == 0
+        and module.hidden_size % hc_prefill_nax.UP_COLS == 0
+        and hc_prefill_nax.plain_qmm_nax(rows, width)
+        and _nax_available()
+    )
+
+
+def _nax_prefill(module, hyper_input, flat, write, rows, hc, hidden, dtype, inject):
+    """Three-dispatch prefill on the tensor units; None to use the MLX path."""
+    global _NAX_BROKEN
+    lead = hyper_input.shape[:-1]
+    pending = None
+    if write is not None:
+        pending = _write_operands(hyper_input, write, hidden, hc)
+        if pending is None:
+            return None
+    down, up = module.input_mix_weight_down, module.input_mix_weight_up
+    try:
+        written, normed, inj_part = hc_prefill_nax.norm_inject(
+            module, flat, pending, rows, hc, hidden, dtype, _eps_array(module), inject
+        )
+        fused_down = hc_prefill_nax.plain_qmm_nax(rows, module.hc_lowrank)
+        if fused_down:
+            act = hc_prefill_nax.down_silu(normed, down, rows, hc)
+        else:
+            # MLX splits K for this few row tiles: keep its kernel.
+            act = nn.silu(down(normed) / hc)
+        mixed, injection = hc_prefill_nax.up_tail(
+            act, up, normed, inj_part, rows, hc, hidden
+        )
+        passthrough = (
+            hyper_input if written is None else written.reshape(hyper_input.shape)
+        )
+        out = (
+            mixed.reshape(*lead, hidden),
+            passthrough,
+            injection.reshape(*lead, hc),
+        )
+        signature = (
+            "prefill_nax",
+            dtype,
+            hc,
+            hidden,
+            module.hc_lowrank,
+            down.bits,
+            up.bits,
+            inject.bits,
+            write is not None,
+            fused_down,
+        )
+        if signature not in _VALIDATED:
+            # The kernels repeat MLX's quantized matmul arithmetic: check the
+            # first call of each specialization against the MLX path bit for
+            # bit (an MLX with a different qmm would fail here) and keep the
+            # MLX path for good if they differ.
+            reference = prefill_forward(module, hyper_input, write, nax=False)
+            mx.eval(out, reference)
+            if not all(
+                mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()
+                for a, b in zip(out, reference)
+            ):
+                _NAX_BROKEN = True
+                logger.warning(
+                    "Qwen4 tensor-unit hyper-connection prefill kernels differ "
+                    "from this MLX's quantized matmul; using the MLX matmul path"
+                )
+                return reference
+            _VALIDATED.add(signature)
+    except Exception as exc:  # noqa: BLE001 - optional native path
+        _NAX_BROKEN = True
+        logger.warning(
+            "Qwen4 tensor-unit hyper-connection prefill kernels failed; using "
+            "the MLX matmul path: %s",
+            exc,
+        )
+        return None
+    return out
+
+
+def prefill_forward(module, hyper_input, write=None, nax=True):
     """Prefill with the fused stream norm and tail/inject epilogue; None on failure.
 
     ``write`` is a pending ``(branch, gate)`` residual write onto ``hyper_input``.
     The norm kernel applies it and returns the written stream as the passthrough;
-    a module without inject weights then returns ``(mixed, written)``.
+    a module without inject weights then returns ``(mixed, written)``. With
+    ``nax`` the projections run in hc_prefill_nax's kernels where they
+    reproduce this path bit for bit.
     """
     global _FAILURE_LOGGED
     try:
@@ -673,6 +781,13 @@ def prefill_forward(module, hyper_input, write=None):
         dtype = hyper_input.dtype
         rows = _rows_of(hyper_input)
         flat = hyper_input.reshape(rows, width)
+        inject = module.block_inject_weight if "block_inject_weight" in module else None
+        if nax and _nax_prefill_ok(module, rows, width, inject):
+            fused = _nax_prefill(
+                module, hyper_input, flat, write, rows, hc, hidden, dtype, inject
+            )
+            if fused is not None:
+                return fused
         if write is None:
             normed = _kernel_norm(module, flat, rows, hc, hidden, dtype, precise=True)
         else:
@@ -686,7 +801,6 @@ def prefill_forward(module, hyper_input, write=None):
         normed = normed.reshape(hyper_input.shape)
         mix = _act(hc)(module.input_mix_weight_down(normed))
         up = module.input_mix_weight_up(mix)
-        inject = module.block_inject_weight if "block_inject_weight" in module else None
         if inject is None or width % (256 * _pack_factor(inject.bits)):
             # Each of the 256 threads dots whole packs of the inject row.
             mixed = _tail(hc, hidden)(up, normed)

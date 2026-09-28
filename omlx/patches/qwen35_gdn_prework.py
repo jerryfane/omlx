@@ -186,7 +186,9 @@ _SOURCE = """
 # separate ABI from the verify kernel above: the production Qwen4 recurrence
 # consumes an FP32 forget gate, while the older donor stores that gate as BF16.
 # Keeping distinct outputs lets this path match mlx-vlm's current arithmetic
-# exactly instead of silently changing the recurrent state update.
+# exactly instead of silently changing the recurrent state update.  The q/k
+# normalization is the verify kernel's L2 arm (stock ``_normalize_qk``), so a
+# decode step and a speculative verify row produce the same bits.
 _QWEN4_DECODE_HEADER = """
     inline float omlx_log1p(float x) {
         float xp1 = 1.0f + x;
@@ -217,7 +219,7 @@ _QWEN4_DECODE_SOURCE = """
                                : 2 * uint(HK) * uint(DK) + head * uint(DV));
 
     T activated[4];
-    float sumsq = 0.0f;
+    T l2acc = T(0);
     for (uint i = 0; i < 4; ++i) {
         uint channel = channel_base + lane * 4 + i;
         float acc = 0.0f;
@@ -230,8 +232,8 @@ _QWEN4_DECODE_SOURCE = """
         T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
         const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
         activated[i] = act;
-        float value = float(act);
-        sumsq += value * value;
+        const T sqv = T(float(act) * float(act));
+        l2acc = T(float(l2acc) + float(sqv));
 
         // T=1: [old0, old1, old2, qkv] -> [old1, old2, qkv].  Each
         // channel is owned by exactly one thread, so no synchronization is
@@ -242,19 +244,23 @@ _QWEN4_DECODE_SOURCE = """
     }
 
     if (is_q || is_k) {
-        sumsq = simd_sum(sumsq);
-        float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
-        float scale = is_q ? float(q_scale) : float(k_scale);
+        // Stock Qwen4 L2 chain, rounding for rounding as the verify kernel's
+        // L2 arm: x * rsqrt(sum(square(x), -1) + 1e-6), dk^-0.5 on q only.
+        float tv = float(l2acc);
+        tv += simd_shuffle_xor(tv, short(16));
+        tv += simd_shuffle_xor(tv, short(8));
+        tv += simd_shuffle_xor(tv, short(4));
+        tv += simd_shuffle_xor(tv, short(2));
+        tv += simd_shuffle_xor(tv, short(1));
+        const T eps = T(float(T(tv)) + float(T(1e-6f)));
+        const T inv = T(metal::precise::rsqrt(float(eps)));
         uint out_base = head * uint(DK) + lane * 4;
         for (uint i = 0; i < 4; ++i) {
-            // rms_norm returns T; multiplying by the Python scalar also
-            // returns T, so preserve both rounding sites.
-            const T rms = T(float(activated[i]) * inv);
-            const T value = T(float(rms) * scale);
+            const T l2 = T(float(activated[i]) * float(inv));
             if (is_q) {
-                q_out[out_base + i] = value;
+                q_out[out_base + i] = T(float(l2) * float(q_scale));
             } else {
-                k_out[out_base + i] = value;
+                k_out[out_base + i] = l2;
             }
         }
     } else {
@@ -365,7 +371,6 @@ def _qwen4_decode_kernel():
                 "conv_state",
                 "conv_w",
                 "q_scale",
-                "k_scale",
                 "b_in",
                 "a_in",
                 "A_log",
@@ -390,7 +395,6 @@ def qwen4_decode_prework_fused(
     conv_state,
     conv_w,
     q_scale,
-    k_scale,
     b,
     a,
     A_log,
@@ -400,7 +404,10 @@ def qwen4_decode_prework_fused(
     dk,
     dv,
 ):
-    """Fuse the exact Qwen4 B1/T1 GDN prework into one Metal dispatch."""
+    """Fuse the exact Qwen4 B1/T1 GDN prework into one Metal dispatch.
+
+    ``q_scale`` is the dk^-0.5 query scale applied after the L2 norm.
+    """
 
     c_dim = int(qkv.shape[-1])
     return _qwen4_decode_kernel()(
@@ -409,7 +416,6 @@ def qwen4_decode_prework_fused(
             conv_state,
             conv_w,
             q_scale,
-            k_scale,
             b,
             a,
             A_log,
@@ -927,13 +933,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         mixed_qkv, z, b, a = _target_verify_linears(
             (self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a), inputs
         )
-        inv = self.head_k_dim**-0.5
         q, k, v, conv_state, g, beta = qwen4_decode_prework_fused(
             mixed_qkv,
             cache[0],
             self.conv1d.weight,
-            mx.array(inv * inv, dtype=mx.bfloat16),
-            mx.array(inv, dtype=mx.bfloat16),
+            mx.array(self.head_k_dim**-0.5, dtype=mx.bfloat16),
             b,
             a,
             self.A_log,
@@ -982,11 +986,14 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 and sites[1] is not None
                 and getattr(type(layer), "_normalize_qk", None) is sites[1]
             )
+        # Qwen4 one-row MTP steps take the fused prework too, so their q/k/v
+        # match the fused B1/T1 decode kernel (same L2 arithmetic).
+        min_length = 1 if l2_norm else 2
         if not (
             (compatible_norm or l2_norm)
             and cache is not None
             and cache.is_speculating
-            and 2 <= length <= 9
+            and min_length <= length <= 9
             and mask is None
             and inputs.dtype in (mx.bfloat16, mx.float16)
             and layer.conv_kernel_size == 4
@@ -1000,15 +1007,15 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             and getattr(layer.conv1d, "bias", None) is None
         ):
             global _VERIFY_REJECT_DIAG
-            # Only T>=2 verify calls can engage; skip S=1 decode probes.
-            if cache is not None and length >= 2 and _VERIFY_REJECT_DIAG < 3:
+            # Only verify-width calls can engage; skip S=1 decode probes.
+            if cache is not None and length >= min_length and _VERIFY_REJECT_DIAG < 3:
                 _VERIFY_REJECT_DIAG += 1
                 failed = [
                     name
                     for name, ok in (
                         ("norm", compatible_norm or l2_norm),
                         ("speculating", cache.is_speculating),
-                        ("length", 2 <= length <= 9),
+                        ("length", min_length <= length <= 9),
                         ("mask", mask is None),
                         ("inputs_dtype", inputs.dtype in (mx.bfloat16, mx.float16)),
                         ("conv_kernel", layer.conv_kernel_size == 4),

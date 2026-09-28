@@ -41,6 +41,7 @@ from .qsa_fast import (
     pool_completed_index_keys,
 )
 from . import hc_fused
+from .hc_projection import env_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,13 @@ def _gathered_min_query_tokens() -> int:
         except ValueError:
             pass
     return 16
+
+
+def _row_exact_verify_armed() -> bool:
+    """Inside an armed MTP verify whose rows must equal serial decode steps."""
+    from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
+
+    return is_row_exact_armed()
 
 
 def _split_text_mrope_positions(
@@ -1058,17 +1066,10 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
 # Dispatch each decoder layer's graph to the GPU as soon as it is built (decode and
 # verify rows only) so the GPU executes layer i while the host builds layer i+1.
 # Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0.
-_EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+_EAGER_DISPATCH = env_enabled("OMLX_QWEN4_EAGER_DISPATCH")
 _EAGER_DISPATCH_MAX_ROWS = 64
 # Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
-_GATHERED_VERIFY_DISABLED = os.environ.get(
-    "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
-).strip().lower() in {"0", "false", "no", "off"}
+_GATHERED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_GATHERED_VERIFY")
 
 
 class Qwen4ExpRMSNorm(nn.Module):
@@ -1687,6 +1688,150 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         output = output.reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))
 
+    def _row_exact_gathered_verify_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Row-exact Lightning MTP verify windows reaching past the QSA budget
+        with text positions: the arms whose rows a serial decode step would
+        attend through gathered QSA, or densely just below the crossover."""
+
+        if not (target_verify and _row_exact_verify_armed()):
+            return False
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            x.ndim == 3
+            and x.shape[0] == 1
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+            and _rank_two_text_position_ids(position_ids, x.shape[1])
+        ):
+            return False
+        if cache.offset:
+            if cache.index_keys is None or cache.index_position_ids is None:
+                return False
+            if (
+                cache.index_keys.shape[1] != cache.offset
+                or cache.index_position_ids.shape[-1] != cache.offset
+            ):
+                return False
+        return cache.offset + x.shape[1] > self.indexer.token_budget
+
+    def _row_exact_gathered_verify(
+        self,
+        x: mx.array,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Attend every verify row exactly as its serial decode step would.
+
+        Projections, norms and RoPE are per-row arithmetic already. Each row
+        then appends its own indexer key, pools blocks on the serial schedule
+        and runs the serial arm for its prefix: gathered QSA decode past the
+        block budget, otherwise plain one-row SDPA over the whole prefix
+        (what the official path computes when the indexer selects every block).
+        """
+
+        from ..qwen3_5 import language as q35_language
+
+        batch, length, _ = x.shape
+        q_proj_output, new_keys, new_values = _target_verify_linears(
+            (self.q_proj, self.k_proj, self.v_proj), x
+        )
+        queries, gate = mx.split(
+            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
+            2,
+            axis=-1,
+        )
+        gate = gate.reshape(batch, length, -1)
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        new_keys = self.k_norm(
+            new_keys.reshape(batch, length, self.num_key_value_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        new_values = new_values.reshape(
+            batch, length, self.num_key_value_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+
+        past_len = cache.offset
+        text_position_ids, rotary_position_ids = _split_text_mrope_positions(
+            position_ids, batch, length, past_len
+        )
+        queries, new_keys = self.rotary_emb.apply_rotary(
+            queries,
+            new_keys,
+            rotary_position_ids,
+            unsqueeze_dim=1,
+        )
+        keys, values = cache.update_and_fetch(new_keys, new_values)
+
+        projected = _target_verify_linear(self.indexer.index_qk_proj, x).reshape(
+            batch,
+            length,
+            self.indexer.n_heads + self.indexer.kv_heads,
+            self.indexer.head_dim,
+        )
+        index_queries = self.indexer.q_layernorm(
+            projected[:, :, : self.indexer.n_heads]
+        ).transpose(0, 2, 1, 3)
+        raw_index_keys = projected[:, :, self.indexer.n_heads :].squeeze(2)
+        index_queries = self.indexer._apply_rope(
+            index_queries,
+            text_position_ids,
+        ).transpose(0, 2, 1, 3)
+
+        outputs = []
+        for row in range(length):
+            key_tokens = past_len + row + 1
+            # A decode step's query is a contiguous [1, H, 1, D] array; the
+            # native decode SDPA accepts only that layout.
+            row_queries = mx.contiguous(queries[:, :, row : row + 1])
+            cache.update_indexer(
+                raw_index_keys[:, row : row + 1],
+                text_position_ids[..., row : row + 1],
+            )
+            row_keys = keys[..., :key_tokens, :]
+            row_values = values[..., :key_tokens, :]
+            if key_tokens // self.indexer.compress_ratio > self.indexer.block_topk:
+                pooled_index_keys = cache.pooled_indexer_keys(
+                    self.indexer.compress_ratio,
+                    self.indexer.k_layernorm,
+                    self.indexer._apply_rope,
+                    cache_tag=self.indexer,
+                )
+                output = contiguous_causal_gathered_qsa_decode(
+                    row_queries,
+                    row_keys,
+                    row_values,
+                    index_queries[:, row : row + 1],
+                    pooled_index_keys,
+                    num_query_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    head_dim=self.head_dim,
+                    indexer_head_dim=self.indexer.head_dim,
+                    compress_ratio=self.indexer.compress_ratio,
+                    token_budget=self.indexer.token_budget,
+                )
+            else:
+                output = q35_language.scaled_dot_product_attention(
+                    row_queries,
+                    row_keys,
+                    row_values,
+                    cache=cache,
+                    scale=self.scale,
+                    mask=None,
+                ).transpose(0, 2, 1, 3)
+            outputs.append(output)
+        output = outputs[0] if length == 1 else mx.concatenate(outputs, axis=1)
+        output = output.reshape(batch, length, -1)
+        return _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
+
     def __call__(
         self,
         x: mx.array,
@@ -1716,6 +1861,18 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ):
             cache._omlx_last_prefill_gathered = True
             return self._gathered_text_prefill(x, cache, position_ids)
+
+        if self._row_exact_gathered_verify_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            if x.shape[1] > 1:
+                cache._omlx_last_prefill_gathered = True
+            return self._row_exact_gathered_verify(x, cache, position_ids)
 
         if self._gathered_text_verify_eligible(
             x,
@@ -2928,6 +3085,95 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         return embeddings.reshape(*embeddings.shape[:-2], -1)
 
 
+# MLX sends dilated depthwise convolutions through its grouped implicit GEMM
+# (one GEMM group per channel: ~8.7 ms for the 6k-row, 10240-channel PLE short
+# conv). This kernel is MLX's own depthwise_conv_1d arithmetic (sequential fp32
+# sum of bf16 products, one rounding) with a dilation; it is checked bit-equal
+# against mx.conv1d on first use. OMLX_QWEN4_PLE_CONV_KERNEL=0 disables it.
+_DEPTHWISE_CONV_SOURCE = r"""
+    const uint c = thread_position_in_grid.x;
+    const uint t = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    if (c >= C) return;
+    // Row counts come from the grid so one pipeline serves every length.
+    const size_t t_out = threads_per_grid.y;
+    const size_t t_in = t_out + (K - 1) * DIL;
+    const device T* src = x + ((size_t)b * t_in + t) * C + c;
+    float acc = 0.0f;
+    for (int i = 0; i < K; ++i) {
+        acc += static_cast<float>(src[(size_t)i * DIL * C]) *
+            static_cast<float>(w[c * K + i]);
+    }
+    y[((size_t)b * t_out + t) * C + c] = static_cast<T>(acc);
+"""
+_DEPTHWISE_CONV_STATE = {
+    "enabled": env_enabled("OMLX_QWEN4_PLE_CONV_KERNEL"),
+    "kernel": None,
+    "validated": False,
+}
+
+
+def _depthwise_conv1d(conv: nn.Conv1d, x: mx.array) -> mx.array:
+    """``conv(x)`` for a bias-free depthwise (groups == channels) Conv1d."""
+
+    weight = getattr(conv, "weight", None)
+    state = _DEPTHWISE_CONV_STATE
+    if not (
+        state["enabled"]
+        and isinstance(weight, mx.array)
+        and x.ndim == 3
+        and weight.ndim == 3
+        and weight.shape[-1] == 1
+        and weight.shape[0] == x.shape[-1] == getattr(conv, "groups", None)
+        and getattr(conv, "stride", None) == 1
+        and getattr(conv, "padding", None) == 0
+        and isinstance(getattr(conv, "dilation", None), int)
+        and "bias" not in conv
+        and x.dtype == weight.dtype
+        and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+        and mx.default_device() == mx.gpu
+    ):
+        return conv(x)
+    batch, rows, channels = x.shape
+    taps = weight.shape[1]
+    out_rows = rows - (taps - 1) * conv.dilation
+    if out_rows <= 0:
+        return conv(x)
+    try:
+        if state["kernel"] is None:
+            state["kernel"] = mx.fast.metal_kernel(
+                name="omlx_qwen4_depthwise_conv1d",
+                input_names=["x", "w"],
+                output_names=["y"],
+                source=_DEPTHWISE_CONV_SOURCE,
+            )
+        output = state["kernel"](
+            inputs=[x, weight],
+            template=[
+                ("T", x.dtype),
+                ("C", channels),
+                ("K", taps),
+                ("DIL", conv.dilation),
+            ],
+            grid=(channels, out_rows, batch),
+            threadgroup=(min(256, channels), 1, 1),
+            output_shapes=[(batch, out_rows, channels)],
+            output_dtypes=[x.dtype],
+        )[0]
+        if not state["validated"]:
+            reference = conv(x)
+            mx.eval(output, reference)
+            if not mx.array_equal(output, reference).item():
+                raise RuntimeError("depthwise conv kernel differs from mx.conv1d")
+            state["validated"] = True
+            return reference
+        return output
+    except Exception as exc:  # noqa: BLE001 - optional fast path
+        state["enabled"] = False
+        logger.warning("Qwen4 PLE depthwise conv kernel disabled: %s", exc)
+        return conv(x)
+
+
 class Qwen4ExpPLELayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int, ple_layer_index: int):
         super().__init__()
@@ -2978,7 +3224,7 @@ class Qwen4ExpPLELayer(nn.Module):
         conv_input = mx.concatenate([state, x], axis=1)
         if cache is not None:
             cache.update_window(2, conv_input, self.short_conv_state_len)
-        return nn.silu(self.conv1d(conv_input)), state
+        return nn.silu(_depthwise_conv1d(self.conv1d, conv_input)), state
 
     def __call__(
         self,
@@ -3368,6 +3614,9 @@ class Qwen4ExpMTPModule(nn.Module):
 class LanguageModel(Qwen3_5LanguageModel):
     _omlx_mtp_multi_request = True
     _omlx_mtp_batch_rollback = True
+    # Lightning MTP verify rows reproduce one-row decode arithmetic, so
+    # greedy MTP output equals MTP-off output (batch_generator._row_exact_verify).
+    _omlx_mtp_row_exact_verify = True
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
@@ -3423,6 +3672,14 @@ class LanguageModel(Qwen3_5LanguageModel):
             if transaction is not None:
                 transaction.abort()
             raise
+
+    def ple_gathers_ahead(self) -> bool:
+        """True when an SSD-backed PLE table gathers rows one prefill chunk ahead."""
+        for layer in self.model.layers:
+            ple = getattr(layer, "ple", None)
+            if ple is not None and getattr(ple.ple_embedding.ngram_embedding, "prefetch", None) is not None:
+                return True
+        return False
 
     def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
         """Start gathering the next prefill chunk's PLE rows while ``current_ids`` runs."""
