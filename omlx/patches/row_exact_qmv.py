@@ -323,15 +323,16 @@ def _kernel(bits: int, group_size: int, fast: bool, unrolled: bool = False):
 
 
 @cache
-def _group_kernel(bits: int, group_size: int, fast: bool, count: int):
+def _group_kernel(bits: int, group_size: int, fast: bool, count: int, unrolled: bool = False):
     inputs = ["x"]
     for i in range(count):
         inputs += [f"w{i}", f"scales{i}", f"biases{i}"]
     return mx.fast.metal_kernel(
-        name=f"omlx_row_exact_qmv_group{count}_b{bits}_gs{group_size}_{int(fast)}",
+        name=f"omlx_row_exact_qmv_group{count}_b{bits}_gs{group_size}_{int(fast)}"
+        + ("_u" if unrolled else ""),
         input_names=inputs,
         output_names=[f"y{i}" for i in range(count)],
-        header=_header(bits, group_size, fast),
+        header=_header(bits, group_size, fast, unrolled),
         source=_group_source(count),
     )
 
