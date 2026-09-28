@@ -452,8 +452,11 @@ class _GroupPlan:
         first = linears[0]
         bits = int(first.bits)
         fast = qmv_fast_layout(k, sizes[0], bits)
-        rows_per_group, rps = geometry or _launch_geometry(bits, fast, max(sizes), rows)
-        self.kernel = _group_kernel(bits, int(first.group_size), fast, len(linears))
+        rows_per_group, rps, unrolled = geometry or (
+            *_launch_geometry(bits, fast, max(sizes), rows),
+            False,
+        )
+        self.kernel = _group_kernel(bits, int(first.group_size), fast, len(linears), unrolled)
         self.template = [("T", x.dtype), ("K_SIZE", k)]
         self.template += [(f"N_{i}", n) for i, n in enumerate(sizes)]
         self.template += [("ROWS", rows_per_group), ("RPS", rps)]
@@ -487,7 +490,11 @@ def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _GroupPlan | 
                 and _kernel_supported(linear, x)
                 for linear in linears
             )
-            and (geometry is None or rows % geometry[0] == 0)
+            and (
+                geometry is None
+                or rows % geometry[0] == 0
+                and (not geometry[2] or unrolled_tile_ok(first.bits, geometry[1], geometry[0]))
+            )
         )
         plans[key] = _GroupPlan(linears, x, rows, geometry) if grouped else None
     return plans[key]
@@ -517,17 +524,20 @@ def quantized_linears(linears, x: mx.array) -> tuple:
     return tuple(y.reshape(*lead, -1) for y in outputs)
 
 
-def quantized_linears_tiled(linears, x: mx.array, rows_per_group: int, rps: int):
+def quantized_linears_tiled(
+    linears, x: mx.array, rows_per_group: int, rps: int, unrolled: bool = False
+):
     """``quantized_linears`` in one launch for 1..MAX_ROWS rows on an explicit
     tile: each threadgroup applies ``2 * rps`` output columns to
-    ``rows_per_group`` rows. Every tile gives each row its one-row ``qmv``
-    bits (at one row, stock ``quantized_matmul``'s); None where the group
-    kernel does not take these projections."""
+    ``rows_per_group`` rows, on the unrolled tile if ``unrolled`` (inside
+    ``unrolled_tile_ok``). Every tile gives each row its one-row ``qmv`` bits
+    (at one row, stock ``quantized_matmul``'s); None where the group kernel
+    does not take these projections."""
     lead = x.shape[:-1]
     rows = 1
     for size in lead:
         rows *= size
-    plan = _group_plan(tuple(linears), x, rows, (rows_per_group, rps))
+    plan = _group_plan(tuple(linears), x, rows, (rows_per_group, rps, unrolled))
     if plan is None:
         return None
     inputs = [x.reshape(rows, x.shape[-1])]

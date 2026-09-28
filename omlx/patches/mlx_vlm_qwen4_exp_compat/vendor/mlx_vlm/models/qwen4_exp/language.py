@@ -1112,19 +1112,15 @@ _MTP_ONE_ROW_STEP: ContextVar[bool] = ContextVar(
 _NORM_SCALE_CACHE_DISABLED = not env_enabled("OMLX_QWEN4_NORM_SCALE_CACHE")
 
 
-def _fused_projection_tile(rows: int) -> tuple[int, int]:
-    """(rows per threadgroup, columns per simdgroup) of the four-projection
-    launch; any tile gives every row its one-row bits."""
-    return (1, 2) if rows == 1 else ((2, 2) if rows % 2 == 0 else (1, 4))
-
-
-def _fused_output_tile(rows: int) -> tuple[int, int]:
-    """The ``o_proj`` tile, as ``_fused_projection_tile``."""
+def _fused_tile(rows: int) -> tuple[int, int, bool]:
+    """(rows per threadgroup, columns per simdgroup, unrolled tile) of the
+    grouped projection and ``o_proj`` launches; every tile gives each row its
+    one-row bits. One row keeps stock ``qmv_fast``'s rolled loop with half its
+    columns per simdgroup (more threadgroups stream the weights); verify rows
+    take the unrolled tile inside ``unrolled_tile_ok``."""
     if rows == 1:
-        return 1, 2
-    if rows % 4 == 0:
-        return 4, 2
-    return (2, 2) if rows % 2 == 0 else (1, 4)
+        return 1, 2, False
+    return (2, 4, True) if rows % 2 == 0 else (1, 4, True)
 
 
 class Qwen4ExpRMSNorm(nn.Module):
@@ -2270,7 +2266,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj),
                 x,
                 x.shape[0] * x.shape[1],
-                _fused_projection_tile(x.shape[0] * x.shape[1]),
+                _fused_tile(x.shape[0] * x.shape[1]),
             )
             is not None
         )
@@ -2284,7 +2280,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         q_out, k_out, v_out, index_out = row_exact_qmv.quantized_linears_tiled(
             (self.q_proj, self.k_proj, self.v_proj, indexer.index_qk_proj),
             x,
-            *_fused_projection_tile(rows),
+            *_fused_tile(rows),
         )
         if position_ids is None:
             # What the indexer and _prepare_projected_qkv build.
@@ -2314,7 +2310,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
     def _fused_output(self, output: mx.array, rows: int) -> mx.array:
         """``o_proj`` of the gated rows in one launch (each row's one-row bits)."""
         projected = row_exact_qmv.quantized_linears_tiled(
-            (self.o_proj,), output, *_fused_output_tile(rows)
+            (self.o_proj,), output, *_fused_tile(rows)
         )
         if projected is not None:
             return projected[0]
