@@ -41,6 +41,7 @@ from .qsa_fast import (
     pool_completed_index_keys,
 )
 from . import hc_fused
+from .hc_projection import env_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -1070,12 +1071,7 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
 # the host's build of the next group.
 # Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0;
 # OMLX_QWEN4_EAGER_DISPATCH_EVERY=1 commits every layer.
-_EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+_EAGER_DISPATCH = env_enabled("OMLX_QWEN4_EAGER_DISPATCH")
 _EAGER_DISPATCH_MAX_ROWS = 64
 _EAGER_DISPATCH_EVERY_DEFAULT = 3
 
@@ -1091,9 +1087,7 @@ def _eager_dispatch_every() -> int:
 _EAGER_DISPATCH_EVERY = _eager_dispatch_every()
 _EAGER_DISPATCH_WARMUP = 6
 # Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
-_GATHERED_VERIFY_DISABLED = os.environ.get(
-    "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
-).strip().lower() in {"0", "false", "no", "off"}
+_GATHERED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_GATHERED_VERIFY")
 
 
 class Qwen4ExpRMSNorm(nn.Module):
@@ -3109,6 +3103,95 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         return embeddings.reshape(*embeddings.shape[:-2], -1)
 
 
+# MLX sends dilated depthwise convolutions through its grouped implicit GEMM
+# (one GEMM group per channel: ~8.7 ms for the 6k-row, 10240-channel PLE short
+# conv). This kernel is MLX's own depthwise_conv_1d arithmetic (sequential fp32
+# sum of bf16 products, one rounding) with a dilation; it is checked bit-equal
+# against mx.conv1d on first use. OMLX_QWEN4_PLE_CONV_KERNEL=0 disables it.
+_DEPTHWISE_CONV_SOURCE = r"""
+    const uint c = thread_position_in_grid.x;
+    const uint t = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    if (c >= C) return;
+    // Row counts come from the grid so one pipeline serves every length.
+    const size_t t_out = threads_per_grid.y;
+    const size_t t_in = t_out + (K - 1) * DIL;
+    const device T* src = x + ((size_t)b * t_in + t) * C + c;
+    float acc = 0.0f;
+    for (int i = 0; i < K; ++i) {
+        acc += static_cast<float>(src[(size_t)i * DIL * C]) *
+            static_cast<float>(w[c * K + i]);
+    }
+    y[((size_t)b * t_out + t) * C + c] = static_cast<T>(acc);
+"""
+_DEPTHWISE_CONV_STATE = {
+    "enabled": env_enabled("OMLX_QWEN4_PLE_CONV_KERNEL"),
+    "kernel": None,
+    "validated": False,
+}
+
+
+def _depthwise_conv1d(conv: nn.Conv1d, x: mx.array) -> mx.array:
+    """``conv(x)`` for a bias-free depthwise (groups == channels) Conv1d."""
+
+    weight = getattr(conv, "weight", None)
+    state = _DEPTHWISE_CONV_STATE
+    if not (
+        state["enabled"]
+        and isinstance(weight, mx.array)
+        and x.ndim == 3
+        and weight.ndim == 3
+        and weight.shape[-1] == 1
+        and weight.shape[0] == x.shape[-1] == getattr(conv, "groups", None)
+        and getattr(conv, "stride", None) == 1
+        and getattr(conv, "padding", None) == 0
+        and isinstance(getattr(conv, "dilation", None), int)
+        and "bias" not in conv
+        and x.dtype == weight.dtype
+        and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+        and mx.default_device() == mx.gpu
+    ):
+        return conv(x)
+    batch, rows, channels = x.shape
+    taps = weight.shape[1]
+    out_rows = rows - (taps - 1) * conv.dilation
+    if out_rows <= 0:
+        return conv(x)
+    try:
+        if state["kernel"] is None:
+            state["kernel"] = mx.fast.metal_kernel(
+                name="omlx_qwen4_depthwise_conv1d",
+                input_names=["x", "w"],
+                output_names=["y"],
+                source=_DEPTHWISE_CONV_SOURCE,
+            )
+        output = state["kernel"](
+            inputs=[x, weight],
+            template=[
+                ("T", x.dtype),
+                ("C", channels),
+                ("K", taps),
+                ("DIL", conv.dilation),
+            ],
+            grid=(channels, out_rows, batch),
+            threadgroup=(min(256, channels), 1, 1),
+            output_shapes=[(batch, out_rows, channels)],
+            output_dtypes=[x.dtype],
+        )[0]
+        if not state["validated"]:
+            reference = conv(x)
+            mx.eval(output, reference)
+            if not mx.array_equal(output, reference).item():
+                raise RuntimeError("depthwise conv kernel differs from mx.conv1d")
+            state["validated"] = True
+            return reference
+        return output
+    except Exception as exc:  # noqa: BLE001 - optional fast path
+        state["enabled"] = False
+        logger.warning("Qwen4 PLE depthwise conv kernel disabled: %s", exc)
+        return conv(x)
+
+
 class Qwen4ExpPLELayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int, ple_layer_index: int):
         super().__init__()
@@ -3159,7 +3242,7 @@ class Qwen4ExpPLELayer(nn.Module):
         conv_input = mx.concatenate([state, x], axis=1)
         if cache is not None:
             cache.update_window(2, conv_input, self.short_conv_state_len)
-        return nn.silu(self.conv1d(conv_input)), state
+        return nn.silu(_depthwise_conv1d(self.conv1d, conv_input)), state
 
     def __call__(
         self,
@@ -3611,6 +3694,14 @@ class LanguageModel(Qwen3_5LanguageModel):
             if transaction is not None:
                 transaction.abort()
             raise
+
+    def ple_gathers_ahead(self) -> bool:
+        """True when an SSD-backed PLE table gathers rows one prefill chunk ahead."""
+        for layer in self.model.layers:
+            ple = getattr(layer, "ple", None)
+            if ple is not None and getattr(ple.ple_embedding.ngram_embedding, "prefetch", None) is not None:
+                return True
+        return False
 
     def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
         """Start gathering the next prefill chunk's PLE rows while ``current_ids`` runs."""
