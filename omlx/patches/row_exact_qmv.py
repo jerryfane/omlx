@@ -446,13 +446,13 @@ class _GroupPlan:
 
     __slots__ = ("kernel", "template", "grid", "output_shapes", "output_dtypes")
 
-    def __init__(self, linears, x: mx.array, rows: int):
+    def __init__(self, linears, x: mx.array, rows: int, geometry=None):
         k = int(x.shape[-1])
         sizes = [int(linear.weight.shape[0]) for linear in linears]
         first = linears[0]
         bits = int(first.bits)
         fast = qmv_fast_layout(k, sizes[0], bits)
-        rows_per_group, rps = _launch_geometry(bits, fast, max(sizes), rows)
+        rows_per_group, rps = geometry or _launch_geometry(bits, fast, max(sizes), rows)
         self.kernel = _group_kernel(bits, int(first.group_size), fast, len(linears))
         self.template = [("T", x.dtype), ("K_SIZE", k)]
         self.template += [(f"N_{i}", n) for i, n in enumerate(sizes)]
@@ -463,13 +463,13 @@ class _GroupPlan:
         self.output_dtypes = [x.dtype] * len(sizes)
 
 
-def _group_plan(linears, x: mx.array, rows: int) -> _GroupPlan | None:
+def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _GroupPlan | None:
     first = linears[0]
     plans = first.__dict__.get("_omlx_row_exact_plans")
     if plans is None:
         plans = {}
         object.__setattr__(first, "_omlx_row_exact_plans", plans)
-    key = (tuple(id(linear) for linear in linears), rows, x.dtype, x.shape[-1])
+    key = (tuple(id(linear) for linear in linears), rows, x.dtype, x.shape[-1], geometry)
     if key not in plans:
         k = int(x.shape[-1])
         fast = [
@@ -487,8 +487,9 @@ def _group_plan(linears, x: mx.array, rows: int) -> _GroupPlan | None:
                 and _kernel_supported(linear, x)
                 for linear in linears
             )
+            and (geometry is None or rows % geometry[0] == 0)
         )
-        plans[key] = _GroupPlan(linears, x, rows) if grouped else None
+        plans[key] = _GroupPlan(linears, x, rows, geometry) if grouped else None
     return plans[key]
 
 
@@ -502,6 +503,33 @@ def quantized_linears(linears, x: mx.array) -> tuple:
     plan = _group_plan(linears, x, rows) if 1 < rows and 1 < len(linears) <= 4 else None
     if plan is None:
         return tuple(quantized_linear(linear, x) for linear in linears)
+    inputs = [x.reshape(rows, x.shape[-1])]
+    for linear in linears:
+        inputs += [linear.weight, linear.scales, linear.biases]
+    outputs = plan.kernel(
+        inputs=inputs,
+        template=plan.template,
+        grid=plan.grid,
+        threadgroup=(32, 2, 1),
+        output_shapes=plan.output_shapes,
+        output_dtypes=plan.output_dtypes,
+    )
+    return tuple(y.reshape(*lead, -1) for y in outputs)
+
+
+def quantized_linears_tiled(linears, x: mx.array, rows_per_group: int, rps: int):
+    """``quantized_linears`` in one launch for 1..MAX_ROWS rows on an explicit
+    tile: each threadgroup applies ``2 * rps`` output columns to
+    ``rows_per_group`` rows. Every tile gives each row its one-row ``qmv``
+    bits (at one row, stock ``quantized_matmul``'s); None where the group
+    kernel does not take these projections."""
+    lead = x.shape[:-1]
+    rows = 1
+    for size in lead:
+        rows *= size
+    plan = _group_plan(tuple(linears), x, rows, (rows_per_group, rps))
+    if plan is None:
+        return None
     inputs = [x.reshape(rows, x.shape[-1])]
     for linear in linears:
         inputs += [linear.weight, linear.scales, linear.biases]
@@ -660,6 +688,7 @@ __all__ = [
     "one_row_qmv",
     "quantized_linear",
     "quantized_linears",
+    "quantized_linears_tiled",
     "rows_qmv",
     "unrolled_tile_ok",
 ]
