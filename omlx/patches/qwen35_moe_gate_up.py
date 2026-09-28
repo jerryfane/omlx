@@ -33,7 +33,6 @@ from mlx_lm.models.switch_layers import (
     QuantizedSwitchLinear,
     SwitchGLU,
     SwitchLinear,
-    _gather_sort,
     _scatter_unsort,
 )
 from mlx_vlm.models.switch_layers import (
@@ -51,6 +50,8 @@ from mlx_vlm.models.switch_layers import (
 
 from ..scheduler import _sync_and_clear_cache
 from . import moe_verify_gather
+from .m5_gather_qmm import fused_gate_up_activation
+from .moe_routes import sort_routes
 from .module_cache import cached_per_module
 
 logger = logging.getLogger(__name__)
@@ -149,14 +150,28 @@ def _make_patched_call(orig_call):
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
+        token_rows = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            # mlx-lm's _gather_sort with the replicated rows left lazy.
+            x_tok, row_map, idx, inv_order = sort_routes(x, indices)
+            x = x_tok[row_map]
+            token_rows = (x_tok, row_map)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_gate_up = gate_up(x, idx, sorted_indices=do_sort)
-        x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+        x_act = None
+        if do_sort and not self.training:
+            # Sorted prefill on M5: the activation in the [gate; up]
+            # matmul's epilogue, token rows read in place (bit-identical;
+            # None keeps this path).
+            x_act = fused_gate_up_activation(
+                gate_up, x, idx, self.activation, token_rows=token_rows
+            )
+        if x_act is None:
+            x_gate_up = gate_up(x, idx, sorted_indices=do_sort)
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            x_act = self.activation(x_up, x_gate)
         x = self.down_proj(
-            self.activation(x_up, x_gate),
+            x_act,
             idx,
             sorted_indices=do_sort,
         )

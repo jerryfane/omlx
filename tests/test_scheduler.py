@@ -4221,15 +4221,56 @@ class TestSchedulerArraysCacheBlockAlignment:
         try:
             step = scheduler._prefill_step_size_for_progress
             assert scheduler._qwen4_wide_prefill_step == 8192
-            assert step(0, 16384) == 2048
-            # Prompts shorter than one narrow plus one wide chunk stay narrow.
-            assert step(2048, 8191) == 2048
+            # Resident PLE (no gather-ahead): the first chunk is wide too.
+            assert scheduler._qwen4_wide_first_chunk is True
+            assert step(0, 16384) == 8192
+            assert step(0, 4095) == 8192
             if paged:
-                # The block clamp ends each wide request on the 8192 grid.
+                # After the first chunk the rest runs wide; the block clamp
+                # ends each wide request on the 8192 grid.
                 assert scheduler.config.paged_cache_block_size == 8192
+                assert step(2048, 2047) == 8192
+                assert step(2048, 2048) == 8192
+                assert step(2048, 8191) == 8192
                 assert step(2048, 14336) == 8192
             else:
+                # Without the clamp the wide step itself ends on the 8192 grid.
+                assert step(2048, 2047) == 6144
+                assert step(2048, 2048) == 6144
+                assert step(2048, 8191) == 6144
                 assert step(2048, 14336) == 6144
+        finally:
+            scheduler.shutdown()
+
+    def test_qwen4_gather_ahead_ple_keeps_narrow_first_chunk(
+        self, mock_tokenizer, tmp_path
+    ):
+        model = self._hybrid_model(model_type="qwen4_exp_text")
+        model.prefetch_ple = lambda next_ids, current_ids: None
+        model.ple_gathers_ahead = lambda: True
+        with (
+            patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=model,
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(prefill_step_size=2048),
+            )
+
+        try:
+            step = scheduler._prefill_step_size_for_progress
+            assert scheduler._qwen4_wide_first_chunk is False
+            assert step(0, 16384) == 2048
+            assert step(2048, 14336) == 6144
         finally:
             scheduler.shutdown()
 

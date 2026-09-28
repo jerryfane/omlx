@@ -16,6 +16,8 @@ from collections.abc import Callable
 
 import mlx.core as mx
 
+from . import qsa_nax
+
 IndexKeyNorm = Callable[[mx.array], mx.array]
 IndexRoPE = Callable[[mx.array, mx.array], mx.array]
 
@@ -26,6 +28,8 @@ _NATIVE_QSA_TOPK_DISABLED = False
 _NATIVE_QSA_TOPK_PROVEN = False
 _NATIVE_QSA_MAIN_DISABLED = False
 _NATIVE_QSA_MAIN_PROVEN = False
+_NAX_QSA_MAIN_DISABLED = False
+_NAX_QSA_MAIN_PROVEN = False
 
 
 def _min_rows(env: str, default: int) -> int:
@@ -962,6 +966,64 @@ def _native_sparse_gqa_attention(
         return None
 
 
+def _nax_sparse_gqa_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_blocks: mx.array,
+    *,
+    q_offset: int,
+) -> mx.array | None:
+    """Tensor-unit QSA (one query per threadgroup over its own blocks), or None.
+
+    Same contract and geometry as :func:`_native_sparse_gqa_attention`
+    (bf16 only); a compile or dispatch failure disables it for the process.
+    """
+
+    global _NAX_QSA_MAIN_DISABLED, _NAX_QSA_MAIN_PROVEN
+    if _NAX_QSA_MAIN_DISABLED:
+        return None
+    if (
+        not qsa_nax.enabled()
+        or queries.ndim != 4
+        or queries.shape[0] != 1
+        or queries.shape[1] != 24
+        or queries.shape[-1] != 256
+        or keys.ndim != 4
+        or values.shape != keys.shape
+        or keys.shape[0] != 1
+        or keys.shape[1] != 2
+        or keys.shape[-1] != 256
+        or queries.dtype != mx.bfloat16
+        or keys.dtype != mx.bfloat16
+        or values.dtype != mx.bfloat16
+        or selected_blocks.ndim != 3
+        or selected_blocks.shape != (1, queries.shape[2], 512)
+        or q_offset < 0
+        or q_offset + queries.shape[2] > keys.shape[2]
+    ):
+        return None
+    if queries.shape[2] < _native_main_min_rows() or not qsa_nax.nax_available():
+        return None
+    try:
+        output = qsa_nax.sparse_gqa_attention(
+            queries,
+            keys,
+            values,
+            selected_blocks,
+            q_offset=q_offset,
+        )
+        if not _NAX_QSA_MAIN_PROVEN:
+            # Prove the JIT pipelines before later cache updates make a
+            # fallback unsafe (same reasoning as the native kernel).
+            mx.eval(output)
+            _NAX_QSA_MAIN_PROVEN = True
+        return output
+    except Exception:
+        _NAX_QSA_MAIN_DISABLED = True
+        return None
+
+
 def _decode_qsa_sdpa(
     queries: mx.array,
     keys: mx.array,
@@ -1312,6 +1374,17 @@ def contiguous_causal_gathered_qsa(
                 selected_block_rows = mx.sort(selected_block_rows, axis=-1)
 
             selected_count = mx.minimum(complete_counts, block_budget)
+
+            nax_output = _nax_sparse_gqa_attention(
+                queries[:, :, start:stop],
+                keys,
+                values,
+                selected_block_rows,
+                q_offset=query_start + start,
+            )
+            if nax_output is not None:
+                outputs.append(nax_output)
+                continue
 
             native_output = _native_sparse_gqa_attention(
                 queries[:, :, start:stop],
