@@ -190,3 +190,66 @@ def test_rows_qmv_every_geometry_equals_one_row_quantized_matmul(
                 rps,
                 per_group,
             )
+
+
+# The unrolled tile keeps the rolled tile's per-accumulator order, so every
+# tile inside its register envelope gives each row the one-row bits (at the
+# DeltaNet verify shapes and bit widths, and past the 4-row blocks).
+@pytest.mark.parametrize(
+    "k, n, bits, group_size",
+    [
+        (2560, 16480, 6, 64),  # DeltaNet stacked in-projection (oQ5e)
+        (2560, 16480, 8, 64),  # its 8-bit layer
+        (6144, 2560, 5, 128),  # DeltaNet out-projection
+        (2560, 1024, 4, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8])
+def test_unrolled_rows_qmv_tiles_equal_one_row_quantized_matmul(
+    k, n, bits, group_size, dtype, rows
+):
+    weight, scales, biases = _quantized(k, n, bits, group_size, dtype, k + n + rows)
+    x = mx.random.normal((1, rows, k)).astype(dtype)
+    expected = mx.concatenate(
+        [
+            mx.quantized_matmul(
+                x[:, r : r + 1], weight, scales, biases, transpose=True,
+                group_size=group_size, bits=bits,
+            )
+            for r in range(rows)
+        ],
+        axis=1,
+    )
+    view = mx.uint32 if dtype == mx.float32 else mx.uint16
+    tiles = [
+        (rps, per_group)
+        for rps in (1, 2, 4, 8)
+        for per_group in range(1, rows + 1)
+        if rows % per_group == 0 and row_exact_qmv.unrolled_tile_ok(bits, rps, per_group)
+    ]
+    for tile in tiles:
+        launch = row_exact_qmv.rows_qmv(
+            weight, scales, biases, bits, group_size, "affine", dtype,
+            lambda _, g=tile: g, unrolled=True,
+        )
+        observed = launch(x)
+        assert observed.shape == expected.shape and observed.dtype == dtype
+        assert mx.array_equal(observed.view(view), expected.view(view)).item(), tile
+
+
+# Tiles past the envelope compiled to wrong bits (5-bit 8x4, 4-bit 2x8).
+@pytest.mark.parametrize("k, n, bits, group_size, tile", [
+    (6144, 2560, 5, 128, (8, 4)),
+    (2560, 1024, 4, 64, (2, 8)),
+])
+def test_unrolled_rows_qmv_refuses_tiles_past_the_register_envelope(
+    k, n, bits, group_size, tile
+):
+    weight, scales, biases = _quantized(k, n, bits, group_size, mx.bfloat16, 3)
+    launch = row_exact_qmv.rows_qmv(
+        weight, scales, biases, bits, group_size, "affine", mx.bfloat16,
+        lambda _: tile, unrolled=True,
+    )
+    with pytest.raises(ValueError):
+        launch(mx.zeros((1, 8, k), dtype=mx.bfloat16))

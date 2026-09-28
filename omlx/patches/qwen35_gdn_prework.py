@@ -73,6 +73,9 @@ _QWEN4_DECODE_QMV = os.environ.get("OMLX_QWEN4_GDN_DECODE_QMV", "1") != "0"
 # launch for every row's prework, recurrence (with the per-step rollback
 # states) and norm-gate, and the out-projection (=0 keeps the per-op path).
 _QWEN4_VERIFY_FUSED = os.environ.get("OMLX_QWEN4_GDN_VERIFY_FUSED", "1") != "0"
+# Its 2..8-row projections on the fully unrolled row-exact tile with the
+# per-row-count tiles below (=0 keeps the rolled tiles of the first geometry).
+_QWEN4_VERIFY_TILES = os.environ.get("OMLX_QWEN4_GDN_VERIFY_TILES", "1") != "0"
 _QWEN4_VERIFY_STEP_KERNELS: dict = {}
 _QWEN4_VERIFY_ENGAGED_LOGGED = False
 _VERIFY_REJECT_DIAG = 0
@@ -1513,6 +1516,23 @@ def _qwen4_verify_out_geometry(rows):
     return (_QWEN4_OUT_QMV_RPS, 1) if rows == 1 else (4, 1)
 
 
+# The same (columns per simdgroup, rows per threadgroup) pairs for the
+# unrolled tile, per block size: the fastest over a chain of 36 layers on M5
+# Ultra (oQ5e: 6-bit in-, 5-bit out-projection), each inside the unrolled
+# tile's register envelope at every bit width the kernel serves (at most 16
+# values per lane). Other block sizes keep the pairs above.
+_QWEN4_VERIFY_IN_TILES = {2: (1, 2), 3: (2, 3), 4: (4, 2), 5: (2, 5), 6: (4, 3), 7: (8, 1), 8: (4, 2)}
+_QWEN4_VERIFY_OUT_TILES = {2: (4, 1), 3: (4, 3), 4: (2, 4), 5: (2, 5), 6: (4, 3), 7: (4, 1), 8: (2, 4)}
+
+
+def _qwen4_verify_in_tile(rows):
+    return _QWEN4_VERIFY_IN_TILES.get(rows) or _qwen4_verify_in_geometry(rows)
+
+
+def _qwen4_verify_out_tile(rows):
+    return _QWEN4_VERIFY_OUT_TILES.get(rows) or _qwen4_verify_out_geometry(rows)
+
+
 def _build_qwen4_verify_plan(module):
     """Resolved operands of the fused speculative verify, or None when ineligible.
 
@@ -1538,13 +1558,16 @@ def _build_qwen4_verify_plan(module):
     if fused is None:
         return None
     weights, scales, biases, _, group_size, bits, mode = fused
+    tiles = _QWEN4_VERIFY_TILES
     in_rows = rows_qmv(
         weights, scales, biases, bits, group_size, mode, mx.bfloat16,
-        _qwen4_verify_in_geometry,
+        _qwen4_verify_in_tile if tiles else _qwen4_verify_in_geometry,
+        unrolled=tiles,
     )
     out_rows = rows_qmv(
         out.weight, out.scales, out.biases, out.bits, out.group_size, out.mode,
-        mx.bfloat16, _qwen4_verify_out_geometry,
+        mx.bfloat16, _qwen4_verify_out_tile if tiles else _qwen4_verify_out_geometry,
+        unrolled=tiles,
     )
     if in_rows is None or out_rows is None:
         return None

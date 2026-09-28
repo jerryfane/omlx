@@ -1353,7 +1353,7 @@ _PARAVIRTUAL_GPU = mx.metal.is_available() and not str(
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.skipif(_PARAVIRTUAL_GPU, reason="per-op reference is not row-exact here")
 @pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 9])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9])
 @pytest.mark.parametrize("seed", [3, 11])
 def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     monkeypatch, qwen4_verify, signatures, rows, seed
@@ -1401,7 +1401,7 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("rows", [2, 3, 4])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("seed", [5, 23])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
     monkeypatch, qwen4_verify, rows, seed

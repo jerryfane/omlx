@@ -44,7 +44,9 @@ _ROW_VALUES_BUDGET = 32
 # moe_verify_gather runs them per (row, expert) pair; the row loop sits
 # inside each K block so the block's weight bytes are fetched once. Columns
 # past N (qmv's partial last tile) are skipped: each column's arithmetic does
-# not depend on which tile computes it.
+# not depend on which tile computes it. ``ROW_EXACT_UNROLL`` precedes every
+# row and column loop: empty, or a full unroll in the ``unrolled`` kernels
+# (unrolling repeats each accumulator's steps in the same order).
 _TILE = r"""
 // Tiny scale/bias arrays (N < 8) arrive in the constant address space, so
 // their pointer type is a template parameter.
@@ -75,7 +77,9 @@ METAL_FUNC void row_exact_tile(
   const device T* xp = x + row0 * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
 
   float result[ROWS][RPS];
+  ROW_EXACT_UNROLL
   for (int i = 0; i < ROWS; i++) {
+    ROW_EXACT_UNROLL
     for (int r = 0; r < RPS; r++) {
       result[i][r] = 0;
     }
@@ -86,9 +90,11 @@ METAL_FUNC void row_exact_tile(
   for (; k < full_limit; k += BLOCK_SIZE) {
     float xs[ROWS][VALUES_PER_THREAD];
     float sums[ROWS];
+    ROW_EXACT_UNROLL
     for (int i = 0; i < ROWS; i++) {
       sums[i] = load_vector<T>(xp + i * K_SIZE, xs[i]);
     }
+    ROW_EXACT_UNROLL
     for (int r = 0; r < RPS; r++) {
       if (PARTIAL && r >= valid) {
         break;
@@ -97,6 +103,7 @@ METAL_FUNC void row_exact_tile(
       decode_w(ws + r * in_vec_size_w, wq);
       float s = sc[r * in_vec_size_g];
       float b = bs[r * in_vec_size_g];
+      ROW_EXACT_UNROLL
       for (int i = 0; i < ROWS; i++) {
         result[i][r] += s * wdot(wq, xs[i]) + sums[i] * b;
       }
@@ -110,9 +117,11 @@ METAL_FUNC void row_exact_tile(
     const int remaining = clamp(
         int(K_SIZE - k - int(simd_lid) * VALUES_PER_THREAD), 0, VALUES_PER_THREAD);
     if (remaining > 0) {
+      ROW_EXACT_UNROLL
       for (int i = 0; i < ROWS; i++) {
         float x_thread[VALUES_PER_THREAD];
         float sum = load_vector_safe<T>(xp + i * K_SIZE, x_thread, remaining);
+        ROW_EXACT_UNROLL
         for (int r = 0; r < RPS; r++) {
           if (PARTIAL && r >= valid) {
             break;
@@ -126,7 +135,9 @@ METAL_FUNC void row_exact_tile(
     }
   }
 
+  ROW_EXACT_UNROLL
   for (int i = 0; i < ROWS; i++) {
+    ROW_EXACT_UNROLL
     for (int r = 0; r < RPS; r++) {
       if (PARTIAL && r >= valid) {
         break;
@@ -272,9 +283,28 @@ inline float wdot(const thread float* wq, const thread float* x) {
 """
 
 
-def _header(bits: int, group_size: int, fast: bool) -> str:
+# Fully unrolled tiles hold every (row, column) accumulator and every row's
+# input values in registers. On the M5 Ultra (MLX 0.32.2) compiler, tiles
+# past this envelope came out with wrong bits (32 or more accumulators; 7 or
+# 8 rows of 16 values at 4 bits), so unrolled launches stay inside it.
+UNROLLED_ACCUMULATORS = 16
+UNROLLED_ROW_VALUES = 80
+
+
+def unrolled_tile_ok(bits: int, rps: int, rows_per_group: int) -> bool:
+    """Whether the unrolled ``qmv_fast`` tile runs ``rps`` columns x
+    ``rows_per_group`` rows per simdgroup inside the envelope above."""
     return (
-        (_HEADER + _DECODED_DOT + _TILE)
+        rps * rows_per_group <= UNROLLED_ACCUMULATORS
+        and rows_per_group * _values_per_thread(bits, True) <= UNROLLED_ROW_VALUES
+    )
+
+
+def _header(bits: int, group_size: int, fast: bool, unrolled: bool = False) -> str:
+    unroll = '_Pragma("clang loop unroll(full)")' if unrolled else ""
+    return (
+        f"#define ROW_EXACT_UNROLL {unroll}\n"
+        + (_HEADER + _DECODED_DOT + _TILE)
         .replace("__BITS__", str(bits))
         .replace("__GS__", str(group_size))
         .replace("__FAST__", "1" if fast else "0")
@@ -282,12 +312,12 @@ def _header(bits: int, group_size: int, fast: bool) -> str:
 
 
 @cache
-def _kernel(bits: int, group_size: int, fast: bool):
+def _kernel(bits: int, group_size: int, fast: bool, unrolled: bool = False):
     return mx.fast.metal_kernel(
-        name=f"omlx_row_exact_qmv_b{bits}_gs{group_size}_{int(fast)}",
+        name=f"omlx_row_exact_qmv_b{bits}_gs{group_size}_{int(fast)}" + ("_u" if unrolled else ""),
         input_names=["x", "w", "scales", "biases"],
         output_names=["y"],
-        header=_header(bits, group_size, fast),
+        header=_header(bits, group_size, fast, unrolled),
         source=_SOURCE,
     )
 
@@ -565,18 +595,21 @@ class RowsQmv:
     """``OneRowQmv`` for a block of rows: every row of ``x`` gets one-row
     ``qmv_fast`` bits. ``geometry(rows)`` gives the output columns per
     simdgroup and the rows each threadgroup applies its decoded weight tile
-    to (a divisor of ``rows``); launch parameters are kept per row count."""
+    to (a divisor of ``rows``); launch parameters are kept per row count.
+    ``unrolled`` runs the fully unrolled tile (same bits) on tiles inside
+    ``unrolled_tile_ok``."""
 
-    __slots__ = ("_kernel", "_weights", "_k", "_n", "_dtype", "_geometry", "_launch")
+    __slots__ = ("_kernel", "_weights", "_k", "_n", "_dtype", "_geometry", "_launch", "_bits")
 
-    def __init__(self, weight, scales, biases, bits, group_size, dtype, geometry):
-        self._kernel = _kernel(bits, group_size, True)
+    def __init__(self, weight, scales, biases, bits, group_size, dtype, geometry, unrolled=False):
+        self._kernel = _kernel(bits, group_size, True, unrolled)
         self._weights = (weight, scales, biases)
         self._k = int(scales.shape[-1]) * group_size
         self._n = int(weight.shape[0])
         self._dtype = dtype
         self._geometry = geometry
         self._launch = {}
+        self._bits = bits if unrolled else None
 
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is ``[..., K]`` of the planned dtype, row-contiguous."""
@@ -584,7 +617,11 @@ class RowsQmv:
         launch = self._launch.get(rows)
         if launch is None:
             rps, per_group = self._geometry(rows)
-            if rows % per_group or self._n % (2 * rps):
+            if (
+                rows % per_group
+                or self._n % (2 * rps)
+                or (self._bits is not None and not unrolled_tile_ok(self._bits, rps, per_group))
+            ):
                 raise ValueError(f"no {rps}x{per_group} tile for {rows} rows of {self._n}")
             launch = self._launch[rows] = (
                 [
@@ -607,12 +644,12 @@ class RowsQmv:
         )[0]
 
 
-def rows_qmv(weight, scales, biases, bits, group_size, mode, dtype, geometry):
+def rows_qmv(weight, scales, biases, bits, group_size, mode, dtype, geometry, unrolled=False):
     """A ``RowsQmv`` on a ``_qmv_fast_layout`` (checked at one column per
     simdgroup; ``__call__`` checks the tile ``geometry`` picks), else None."""
     if not _qmv_fast_layout(weight, scales, biases, bits, group_size, mode, dtype, 1):
         return None
-    return RowsQmv(weight, scales, biases, bits, group_size, dtype, geometry)
+    return RowsQmv(weight, scales, biases, bits, group_size, dtype, geometry, unrolled)
 
 
 __all__ = [
@@ -623,4 +660,5 @@ __all__ = [
     "quantized_linear",
     "quantized_linears",
     "rows_qmv",
+    "unrolled_tile_ok",
 ]
