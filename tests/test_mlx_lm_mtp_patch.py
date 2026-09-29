@@ -4522,13 +4522,13 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
     """Copied drafts never change greedy output, whichever of them is wrong.
 
     The proposer is replaced by the true continuation with one token flipped
-    at a position that moves every cycle, so the widest (8-row) windows are
+    at a position that moves every cycle, so the widest (16-row) windows are
     verified with accepted lengths from none to all.
     """
     from omlx.patches.mlx_lm_mtp import context_copy
 
     widest = context_copy.MAX_COPY
-    flips = (0, 1, 3, widest - 1, widest)  # ``widest``: nothing flipped
+    flips = (0, 1, 7, widest - 1, widest)  # ``widest``: nothing flipped
     previous = mlx_lm_mtp.is_mtp_active()
     try:
         mlx_lm_mtp.set_mtp_active(True)
@@ -4552,7 +4552,7 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
                 copied[wrong] ^= 1
             return copied if len(copied) >= 2 else []
 
-        def observe(self, count):
+        def observe(self, count, drafted):
             accepted.append(count)
 
         monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)

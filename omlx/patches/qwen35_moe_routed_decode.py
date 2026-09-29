@@ -123,7 +123,9 @@ _TOPK_FOLD = os.environ.get("OMLX_QWEN35_MOE_TOPK_FOLD", "1") != "0"
 # four rows on the gate+up launch runs out of ALU headroom and the separate
 # routing launch is as fast or faster (M5 Ultra, oQ5e shapes).
 _TOPK_FOLD_MAX_ROWS = 3
-WINDOW_MAX_ROWS = 8
+# Row-exact verify windows up to the hyper-connection and GDN verify
+# kernels' 16-row ceiling; the kernels index rows from the grid.
+WINDOW_MAX_ROWS = 16
 _WINDOW_DISABLED = False
 _WINDOW_PROVEN = False
 
@@ -895,7 +897,9 @@ def routed_verify_window(block, x):
         return None
     hidden = x.shape[-1]
     rows = x.size // hidden
-    if not 1 <= rows <= WINDOW_MAX_ROWS or not router_eligible(x, block.num_experts):
+    if not 1 <= rows <= WINDOW_MAX_ROWS or not router_eligible(
+        x, block.num_experts, WINDOW_MAX_ROWS
+    ):
         return None
     plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
     if plan is None or plan.hidden != hidden or not plan.fold or plan.router_logits is None:
@@ -904,7 +908,7 @@ def routed_verify_window(block, x):
     logits = plan.router_logits(x)
     folded = _topk_folds(plan, logits)
     if not folded:
-        routing = softmax_topk_rows(logits, TOP_K)
+        routing = softmax_topk_rows(logits, TOP_K, WINDOW_MAX_ROWS)
         if routing is None:
             routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), TOP_K)
         inds, scores = routing
