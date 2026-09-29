@@ -140,7 +140,9 @@ def _verify(block, x, window):
     return out
 
 def _check(block, x, engaged):
-    """Window rows == one-token rows == the composed verifier's rows."""
+    """Window rows == one-token rows == the composed verifier's rows (the
+    latter only up to the shared router cap: past it the composed verifier
+    runs stock argpartition routing, not the one-token arithmetic)."""
     count = len(engaged)
     new = _verify(block, x, window=True)
     ref = _serial(block, x)
@@ -149,7 +151,8 @@ def _check(block, x, engaged):
     # Engaged for the window, declined with the kill switch set.
     assert engaged[count:] == [True, False]
     assert _same_bits(new, ref)
-    assert _same_bits(new, old)
+    if x.size // HIDDEN <= router._MAX_ROWS:
+        assert _same_bits(new, old)
 
 
 @pytest.fixture

@@ -4224,7 +4224,7 @@ def _run_verify_cycle_chain(
         state.stats.copy_cycles += 1
         state.stats.copy_drafted += k
         state.stats.copy_accepted += m
-        state.context_copy.observe(m)
+        state.context_copy.observe(m, k)
     else:
         if len(state.stats.depth_drafted) < state.depth:
             pad = state.depth - len(state.stats.depth_drafted)

@@ -85,6 +85,9 @@ _QWEN4_VERIFY_DEFERRED_STATES = (
 )
 _QWEN4_VERIFY_STEP_KERNELS: dict = {}
 _QWEN4_VERIFY_ENGAGED_LOGGED = False
+# The fused verify's norm-gate stage runs step t on simdgroup t of its
+# head_v_dim // 8 = 16 simdgroups, so a window holds at most 16 rows.
+_QWEN4_VERIFY_MAX_ROWS = 16
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -2007,7 +2010,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             and cache is not None
             and cache.is_speculating
             and cache.lengths is None
-            and 1 <= length <= 9
+            and 1 <= length <= _QWEN4_VERIFY_MAX_ROWS
             and (length == 1 or is_row_exact_armed())
             and _qwen4_verify_state_eligible(inputs, cache)
         ):
