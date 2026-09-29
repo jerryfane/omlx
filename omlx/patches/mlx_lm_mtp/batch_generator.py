@@ -1603,19 +1603,11 @@ def _logprobs(logits_2d):
 # bf16 subtraction is inexact, two adjacent logits can land on one
 # log-probability, and the tie goes to the lower token id. Verify rows take
 # the same argmax so greedy MTP output equals MTP-off output.
-# OMLX_MTP_GREEDY_LOGPROB_PICK=0 restores the raw-logit argmax.
-_GREEDY_ON_LOGPROBS = (
-    os.environ.get("OMLX_MTP_GREEDY_LOGPROB_PICK", "1").strip() != "0"
-)
-
-
-def _greedy_targets(logits, logprobs):
+def _greedy_targets(logprobs):
     """Greedy tokens of verify rows, as the serial greedy sampler picks them."""
     import mlx.core as mx
 
-    return mx.argmax(logprobs if _GREEDY_ON_LOGPROBS else logits, axis=-1).astype(
-        mx.int32
-    )
+    return mx.argmax(logprobs, axis=-1).astype(mx.int32)
 
 
 def _accept_lp_for(sampler, lp):
@@ -4039,7 +4031,7 @@ def _run_verify_cycle_chain(
         state.stats.zero_cycles += 1
     elif is_greedy:
         if greedy_result is None:
-            targets = _greedy_targets(rows, combined_lp)  # (k+1,)
+            targets = _greedy_targets(combined_lp)  # (k+1,)
             matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
             m_arr = mx.cumprod(matches).sum().reshape(1)
             host_arr = mx.concatenate([m_arr, targets, state.drafts.astype(mx.int32)])

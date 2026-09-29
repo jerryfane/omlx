@@ -3920,8 +3920,9 @@ def test_greedy_verify_targets_match_the_serial_greedy_sampler():
     row[0, 100] = 3.0
     rows = mx.concatenate([row, row[:, ::-1]])
     serial = mx.concatenate([make_sampler(temp=0.0)(bg._logprobs(r[None])) for r in rows])
-    targets = bg._greedy_targets(rows, bg._logprobs(rows))
+    targets = bg._greedy_targets(bg._logprobs(rows))
     assert serial.tolist() == [5, 4095 - 100]
+    assert mx.argmax(rows, axis=-1).tolist() != serial.tolist()
     assert targets.tolist() == serial.tolist()
 
 
