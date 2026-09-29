@@ -205,6 +205,20 @@ def test_window_rows_equal_one_token_decode(seed, topk_fold, engaged):
     _check(block, _inputs(3, 1, batch=2), engaged)
 
 
+@pytest.mark.parametrize("rows", [2, 5, 8])
+def test_batched_decode_rows_equal_one_token_decode(rows, engaged):
+    """Several requests' one-token decode ([B, 1, hidden], not a verify
+    window) runs the window launches: every row equals its own fused
+    one-token call bit for bit."""
+    block = _block(0)
+    x = _inputs(rows, 0).reshape(rows, 1, HIDDEN)
+    count = len(engaged)
+    got = block(x)
+    ref = _serial(block, x)
+    assert engaged[count:] == [True]
+    assert _same_bits(got, ref.reshape(got.shape))
+
+
 def test_four_bit_window_rows_equal_one_token_decode(engaged):
     block = _block(2, bits=4)
     for rows in (2, 3, 4, 8):

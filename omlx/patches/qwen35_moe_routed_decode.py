@@ -972,6 +972,12 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     def patched_call(self, x):
         global _DISABLED, _PROVEN
         plan = routed_decode_plan(self, x)
+        if plan is None and x.ndim == 3 and x.shape[1] == 1 and x.shape[0] > 1:
+            # Batched one-token decode: every row runs the one-token
+            # arithmetic of its own stream in the window launches.
+            y = routed_verify_window(self, x)
+            if y is not None:
+                return y.reshape(x.shape)
         if plan is None or not router_eligible(x, self.num_experts):
             return orig_call(self, x)
         shared = shared_gate = None
