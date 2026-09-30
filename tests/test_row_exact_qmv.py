@@ -8,6 +8,8 @@ quantized projection has the serial step's bits; stock multi-row kernels
 
 from __future__ import annotations
 
+import inspect
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -19,8 +21,10 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 
 @pytest.fixture(autouse=True)
 def disarm():
+    row_exact_qmv._UNROLLED_VERDICTS.clear()
     yield
     qwen35_verify_qmm.set_verify_qmm_armed(False)
+    row_exact_qmv._UNROLLED_VERDICTS.clear()
 
 
 def _linear(k, n, bits, group_size, seed):
@@ -253,3 +257,53 @@ def test_unrolled_rows_qmv_refuses_tiles_past_the_register_envelope(
     )
     with pytest.raises(ValueError):
         launch(mx.zeros((1, 8, k), dtype=mx.bfloat16))
+
+
+def _miscompiled(factory):
+    """``factory`` whose unrolled kernels return every output off by one, as a
+    GPU whose compiler gets the unrolled tile wrong would."""
+    signature = inspect.signature(factory)
+
+    def make(*args, **kwargs):
+        kernel = factory(*args, **kwargs)
+        if not signature.bind(*args, **kwargs).arguments.get("unrolled", False):
+            return kernel
+        return lambda **kw: [y + 1 for y in kernel(**kw)]
+
+    return make
+
+
+# A GPU that computes an unrolled tile wrong (an M3 Ultra did at 4-bit gs64)
+# must still get one-row bits: the first launch of each shape is checked and
+# falls back to the rolled tile.
+def test_rows_qmv_falls_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypatch):
+    k, n, bits, group_size, rows = 2560, 1024, 4, 64, 4
+    weight, scales, biases = _quantized(k, n, bits, group_size, mx.bfloat16, 5)
+    x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
+    expected = mx.concatenate(
+        [
+            mx.quantized_matmul(
+                x[:, r : r + 1], weight, scales, biases, transpose=True,
+                group_size=group_size, bits=bits,
+            )
+            for r in range(rows)
+        ],
+        axis=1,
+    )
+    monkeypatch.setattr(row_exact_qmv, "_kernel", _miscompiled(row_exact_qmv._kernel))
+    launch = row_exact_qmv.rows_qmv(
+        weight, scales, biases, bits, group_size, "affine", mx.bfloat16,
+        lambda _: (2, 2), unrolled=True,
+    )
+    assert _bit_equal(launch(x), expected)
+    assert list(row_exact_qmv._UNROLLED_VERDICTS.values()) == [False]
+
+
+def test_grouped_tiles_fall_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypatch):
+    linears = [_linear(2560, n, 4, 64, seed) for seed, n in enumerate((1024, 512))]
+    x = mx.random.normal((1, 4, 2560)).astype(mx.bfloat16)
+    monkeypatch.setattr(row_exact_qmv, "_group_kernel", _miscompiled(row_exact_qmv._group_kernel))
+    outputs = row_exact_qmv.quantized_linears_tiled(linears, x, 2, 4, True)
+    for linear, observed in zip(linears, outputs):
+        assert _bit_equal(observed, _serial(linear, x))
+    assert list(row_exact_qmv._UNROLLED_VERDICTS.values()) == [False]

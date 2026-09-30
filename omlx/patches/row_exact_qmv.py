@@ -23,12 +23,15 @@ the weights; it replaces ``quantized_matmul`` bit for bit.
 
 from __future__ import annotations
 
+import logging
 from functools import cache
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .moe_verify_gather import _BITS, _GROUP_SIZES, _HEADER, qmv_fast_layout
+
+logger = logging.getLogger(__name__)
 
 MAX_ROWS = 8
 # Output columns per simdgroup (qmv's own tile: a threadgroup owns 8).
@@ -300,6 +303,50 @@ def unrolled_tile_ok(bits: int, rps: int, rows_per_group: int) -> bool:
     )
 
 
+# The envelope above was measured on one GPU generation; another compiler or
+# GPU can still get a tile inside it wrong (an M3 Ultra did at 4-bit gs64:
+# whole rows off, not rounding). So the first launch of each unrolled shape
+# is checked on the running GPU against stock one-row ``quantized_matmul`` of
+# the same weights on a fixed input; a shape with any differing bit runs the
+# rolled tile (same arithmetic, same geometry) from then on. Verdicts are per
+# compiled shape: the bug is in code generation, not in the weight values.
+_UNROLLED_VERDICTS: dict = {}
+
+
+def unrolled_tile_verified(shape: tuple, run, weights: list, bits: int, group_size: int, rows: int, k: int, dtype) -> bool:
+    """Whether the unrolled launch ``shape`` (a hashable key of every template
+    parameter) matches stock one-row ``quantized_matmul`` bit for bit.
+    ``run(x)`` launches it on ``x`` [rows, k] and returns one output per
+    ``(weight, scales, biases)`` of ``weights``; checked once per shape."""
+    verdict = _UNROLLED_VERDICTS.get(shape)
+    if verdict is None:
+        x = (mx.random.normal((rows, k), key=mx.random.key(rows)) * 0.5).astype(dtype)
+        got = run(x)
+        want = [
+            mx.concatenate(
+                [
+                    mx.quantized_matmul(
+                        x[r : r + 1], w, scales=s, biases=b,
+                        transpose=True, group_size=group_size, bits=bits,
+                    )
+                    for r in range(rows)
+                ]
+            )
+            for w, s, b in weights
+        ]
+        mx.eval(got, want)
+        verdict = _UNROLLED_VERDICTS[shape] = all(
+            mx.array_equal(a.reshape(b.shape), b).item() for a, b in zip(got, want)
+        )
+        if not verdict:
+            logger.warning(
+                "row-exact unrolled tile %s differs from one-row quantized_matmul "
+                "on this GPU; it runs the rolled tile instead",
+                shape,
+            )
+    return verdict
+
+
 def _header(bits: int, group_size: int, fast: bool, unrolled: bool = False) -> str:
     unroll = '_Pragma("clang loop unroll(full)")' if unrolled else ""
     return (
@@ -465,6 +512,20 @@ class _GroupPlan:
         self.output_shapes = [(rows, n) for n in sizes]
         self.output_dtypes = [x.dtype] * len(sizes)
 
+    def launch(self, linears, x: mx.array) -> list:
+        """The group's outputs for ``x`` of shape [rows, K]."""
+        inputs = [x]
+        for linear in linears:
+            inputs += [linear.weight, linear.scales, linear.biases]
+        return self.kernel(
+            inputs=inputs,
+            template=self.template,
+            grid=self.grid,
+            threadgroup=(32, 2, 1),
+            output_shapes=self.output_shapes,
+            output_dtypes=self.output_dtypes,
+        )
+
 
 def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _GroupPlan | None:
     first = linears[0]
@@ -496,7 +557,21 @@ def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _GroupPlan | 
                 and (not geometry[2] or unrolled_tile_ok(first.bits, geometry[1], geometry[0]))
             )
         )
-        plans[key] = _GroupPlan(linears, x, rows, geometry) if grouped else None
+        plan = _GroupPlan(linears, x, rows, geometry) if grouped else None
+        if plan is not None and geometry is not None and geometry[2]:
+            k = int(x.shape[-1])
+            shape = (
+                "group", int(first.bits), int(first.group_size), fast[0], k,
+                tuple(int(linear.weight.shape[0]) for linear in linears),
+                rows, geometry[0], geometry[1], x.dtype,
+            )
+            weights = [(linear.weight, linear.scales, linear.biases) for linear in linears]
+            if not unrolled_tile_verified(
+                shape, lambda probe: plan.launch(linears, probe), weights,
+                int(first.bits), int(first.group_size), rows, k, x.dtype,
+            ):
+                plan = _GroupPlan(linears, x, rows, (geometry[0], geometry[1], False))
+        plans[key] = plan
     return plans[key]
 
 
@@ -510,17 +585,7 @@ def quantized_linears(linears, x: mx.array) -> tuple:
     plan = _group_plan(linears, x, rows) if 1 < rows and 1 < len(linears) <= 4 else None
     if plan is None:
         return tuple(quantized_linear(linear, x) for linear in linears)
-    inputs = [x.reshape(rows, x.shape[-1])]
-    for linear in linears:
-        inputs += [linear.weight, linear.scales, linear.biases]
-    outputs = plan.kernel(
-        inputs=inputs,
-        template=plan.template,
-        grid=plan.grid,
-        threadgroup=(32, 2, 1),
-        output_shapes=plan.output_shapes,
-        output_dtypes=plan.output_dtypes,
-    )
+    outputs = plan.launch(linears, x.reshape(rows, x.shape[-1]))
     return tuple(y.reshape(*lead, -1) for y in outputs)
 
 
@@ -540,17 +605,7 @@ def quantized_linears_tiled(
     plan = _group_plan(tuple(linears), x, rows, (rows_per_group, rps, unrolled))
     if plan is None:
         return None
-    inputs = [x.reshape(rows, x.shape[-1])]
-    for linear in linears:
-        inputs += [linear.weight, linear.scales, linear.biases]
-    outputs = plan.kernel(
-        inputs=inputs,
-        template=plan.template,
-        grid=plan.grid,
-        threadgroup=(32, 2, 1),
-        output_shapes=plan.output_shapes,
-        output_dtypes=plan.output_dtypes,
-    )
+    outputs = plan.launch(linears, x.reshape(rows, x.shape[-1]))
     return tuple(y.reshape(*lead, -1) for y in outputs)
 
 
@@ -636,19 +691,22 @@ class RowsQmv:
     simdgroup and the rows each threadgroup applies its decoded weight tile
     to (a divisor of ``rows``); launch parameters are kept per row count.
     ``unrolled`` runs the fully unrolled tile (same bits) on tiles inside
-    ``unrolled_tile_ok``."""
+    ``unrolled_tile_ok`` that this GPU computes bit-exactly (checked once per
+    tile shape), else the rolled tile."""
 
-    __slots__ = ("_kernel", "_weights", "_k", "_n", "_dtype", "_geometry", "_launch", "_bits")
+    __slots__ = ("_kernel", "_weights", "_k", "_n", "_dtype", "_geometry", "_launch", "_bits", "_group_size", "_unrolled")
 
     def __init__(self, weight, scales, biases, bits, group_size, dtype, geometry, unrolled=False):
-        self._kernel = _kernel(bits, group_size, True, unrolled)
+        self._kernel = _kernel(bits, group_size, True, False)
         self._weights = (weight, scales, biases)
         self._k = int(scales.shape[-1]) * group_size
         self._n = int(weight.shape[0])
         self._dtype = dtype
         self._geometry = geometry
         self._launch = {}
-        self._bits = bits if unrolled else None
+        self._bits = bits
+        self._group_size = group_size
+        self._unrolled = unrolled
 
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is ``[..., K]`` of the planned dtype, row-contiguous."""
@@ -659,21 +717,39 @@ class RowsQmv:
             if (
                 rows % per_group
                 or self._n % (2 * rps)
-                or (self._bits is not None and not unrolled_tile_ok(self._bits, rps, per_group))
+                or (self._unrolled and not unrolled_tile_ok(self._bits, rps, per_group))
             ):
                 raise ValueError(f"no {rps}x{per_group} tile for {rows} rows of {self._n}")
-            launch = self._launch[rows] = (
-                [
-                    ("T", self._dtype),
-                    ("K_SIZE", self._k),
-                    ("N_SIZE", self._n),
-                    ("ROWS", per_group),
-                    ("RPS", rps),
-                ],
-                (32, 2 * (rows // per_group), self._n // (2 * rps)),
-            )
-        template, grid = launch
-        return self._kernel(
+            template = [
+                ("T", self._dtype),
+                ("K_SIZE", self._k),
+                ("N_SIZE", self._n),
+                ("ROWS", per_group),
+                ("RPS", rps),
+            ]
+            grid = (32, 2 * (rows // per_group), self._n // (2 * rps))
+            kernel = self._kernel
+            if self._unrolled:
+                unrolled = _kernel(self._bits, self._group_size, True, True)
+                shape = ("rows", self._bits, self._group_size, self._k, self._n, rows, per_group, rps, self._dtype)
+
+                def run(probe):
+                    return unrolled(
+                        inputs=[probe, *self._weights],
+                        template=template,
+                        grid=grid,
+                        threadgroup=(32, 2, 1),
+                        output_shapes=[(rows, self._n)],
+                        output_dtypes=[self._dtype],
+                    )
+
+                if unrolled_tile_verified(
+                    shape, run, [self._weights], self._bits, self._group_size, rows, self._k, self._dtype
+                ):
+                    kernel = unrolled
+            launch = self._launch[rows] = (kernel, template, grid)
+        kernel, template, grid = launch
+        return kernel(
             inputs=[x, *self._weights],
             template=template,
             grid=grid,
