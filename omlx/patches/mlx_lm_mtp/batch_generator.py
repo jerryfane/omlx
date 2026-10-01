@@ -3956,16 +3956,17 @@ def _predraft(gen_batch, state, drafter, captured, host_arr, m_arr, anchor) -> b
 
 
 def _context_copy_drafts(
-    gen_batch: Any, state: _MtpState, committed_ids: List[int], is_greedy: bool
+    gen_batch: Any, state: _MtpState, committed_ids: List[int]
 ) -> List[int]:
     """Draft the next window by copying from the context, if it repeats.
 
-    Greedy singleton chain cycles only: acceptance is exact token equality
-    against the target's own argmax, so any draft source leaves the output
-    unchanged. Returns ``[]`` when the MTP head should draft instead.
+    Singleton chain cycles. Greedy acceptance is exact token equality against
+    the target's own argmax; sampled acceptance treats the copy as a draft
+    distribution with all its mass on the copied token (``_copy_draft_q``),
+    so the Leviathan/Chen rule keeps the sampled distribution exact. Either
+    way any draft source leaves the output distribution unchanged. Returns
+    ``[]`` when the MTP head should draft instead.
     """
-    if not is_greedy:
-        return []
     if state.context_copy is None:
         # False marks a request that never copies (disabled, or a DSpark
         # host whose drafter owns the window).
@@ -3983,6 +3984,14 @@ def _context_copy_drafts(
         gen_batch.max_tokens[0] - gen_batch._num_tokens[0] - len(committed_ids) - 1
     )
     return copier.propose(room)
+
+
+def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
+    """One-hot draft distributions for a copied window."""
+    import mlx.core as mx
+
+    ids = mx.array(copied, dtype=mx.int32)[:, None]
+    return SparseDraftQ(ids, mx.zeros(ids.shape, dtype=mx.float32), vocab)
 
 
 def _run_verify_cycle_chain(
@@ -4259,9 +4268,7 @@ def _run_verify_cycle_chain(
             else:
                 draft_jobs.append(job)
         elif draft_jobs is None:
-            copied = _context_copy_drafts(
-                gen_batch, state, committed_ids, is_greedy
-            )
+            copied = _context_copy_drafts(gen_batch, state, committed_ids)
             _chain_next_drafts(
                 gen_batch,
                 state,
@@ -4273,7 +4280,12 @@ def _run_verify_cycle_chain(
             if copied:
                 state.drafts = mx.array(copied, dtype=mx.uint32)
                 state.draft_lps = []
-                state.draft_accept_lps = []
+                # A copy is a deterministic proposer: q puts all its mass on
+                # the copied token, so acceptance is p(token) and the
+                # residual on rejection is p without it.
+                state.draft_accept_lps = (
+                    [] if is_greedy else _copy_draft_q(copied, combined_lp.shape[-1])
+                )
                 state.copy_drafts = True
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))

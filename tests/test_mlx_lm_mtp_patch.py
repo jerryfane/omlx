@@ -4034,6 +4034,42 @@ def test_sparse_stochastic_acceptance_preserves_filtered_target_marginal():
         mx.set_default_device(previous_device)
 
 
+@pytest.mark.parametrize("top_k", [0, 3])
+@pytest.mark.parametrize("copied", [3, 1, 0])
+def test_copied_drafts_preserve_filtered_target_marginal(top_k, copied):
+    """A context copy is a deterministic draft; with its one-hot q the emitted
+    token still follows the filtered target, whether the copied token is the
+    likely one (3), an unlikely one (1) or, at top-k 3, outside the support (0).
+    """
+    from omlx.utils.sampling import make_sampler
+
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.random.seed(787 + copied)
+        sampler = make_sampler(temp=0.6, top_k=top_k)
+        target = mx.array([0.05, 0.1, 0.3, 0.55])
+        lp = mx.broadcast_to(mx.log(target), (3, 4))
+        scaled = mx.log(target) / 0.6
+        if top_k:
+            scaled = mx.where(mx.arange(4) == 0, -float("inf"), scaled)
+        filtered = mx.softmax(scaled, axis=-1)
+        drafts = mx.array([copied, copied], dtype=mx.uint32)
+        q = bg._copy_draft_q([copied, copied], 4)
+        counts = mx.zeros((4,), dtype=mx.int32)
+        for _ in range(64):
+            samples = []
+            for _ in range(64):
+                result = bg._stochastic_verify_tokens(sampler, lp, drafts, q)
+                samples.append(mx.where(result[0] > 0, result[1], result[3]))
+            emitted = mx.stack(samples)
+            counts += (emitted[:, None] == mx.arange(4)).sum(axis=0)
+            mx.eval(counts)
+        assert mx.all(mx.abs(counts / 4096 - filtered) < 0.03), counts.tolist()
+    finally:
+        mx.set_default_device(previous_device)
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("temperature", [0.7, 1.0])
 def test_acceptance_density_matches_low_precision_sampler(dtype, temperature):
