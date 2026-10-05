@@ -4602,6 +4602,24 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
         mlx_lm_mtp.set_mtp_active(previous)
 
 
+@pytest.mark.parametrize("wide_window", [False, True])
+def test_context_copy_width_follows_the_targets_verify_window(wide_window):
+    """A verbatim run after a whole accept copies 15 tokens only for a target
+    that verifies 16-row windows; other targets (GLM-5.3 rolls back at most
+    8 rows) keep 7-token copies."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    source = list(range(1000, 1200))
+    history = source + source[:100]  # the tail repeats the source verbatim
+    copier = context_copy.ContextCopy(wide_window=wide_window)
+    copier.extend(history, [])
+    assert copier.propose(64) == source[100:107]
+    copier.observe(7, 7)
+    copier.extend(history + source[100:107], [])
+    expected = 15 if wide_window else 7
+    assert copier.propose(64) == source[107 : 107 + expected]
+
+
 @pytest.mark.parametrize("size", [2, 4])
 @pytest.mark.parametrize("late_join", [False, True])
 def test_initialization_uses_one_forward_without_cache_extraction(

@@ -3971,7 +3971,7 @@ def _context_copy_drafts(
         # False marks a request that never copies (disabled, or a DSpark
         # host whose drafter owns the window).
         state.context_copy = (
-            _context_copy.ContextCopy()
+            _context_copy.ContextCopy(wide_window=_row_exact_verify(gen_batch.model))
             if _context_copy.ENABLED and _dspark_host(gen_batch.model) is None
             else False
         )
