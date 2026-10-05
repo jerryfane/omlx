@@ -140,10 +140,16 @@ class BatchPolicy:
         self.losing = 0
         self.clear_losing = 0
 
-    def start_parked(self, cooldown):
-        """Decode ordinarily for ``cooldown`` steps before measuring MTP again."""
+    def start_parked(self, cooldown, next_cooldown=None):
+        """Decode ordinarily for ``cooldown`` steps before measuring MTP again.
+
+        ``next_cooldown`` is the cooldown of the next park (default: twice
+        this one, up to 4096 steps).
+        """
         self.remaining = cooldown
-        self.cooldown = min(4096, cooldown * 2)
+        self.cooldown = (
+            min(4096, cooldown * 2) if next_cooldown is None else next_cooldown
+        )
         self.decisions = 0
 
     def held_up(self):
@@ -156,26 +162,47 @@ class ParkMemory:
 
     Every join or finish starts a new cohort policy, which would measure
     ordinary decode and MTP again from scratch. Where MTP just lost at k rows,
-    a new cohort of at least k rows starts parked with that cohort's next
-    cooldown (MTP does not get cheaper per row as rows are added); a cohort
-    where MTP held up for 32 measured decisions clears the verdicts it
-    contradicts (those at its row count or fewer).
+    a new cohort of at least k rows starts parked (MTP does not get cheaper
+    per row as rows are added) for what is left of that park. The park runs
+    on one clock per model, counted in batched decode steps of any cohort,
+    so cohorts that come and go neither restart nor extend it: once it
+    expires, the next cohort measures MTP again. A cohort where MTP held up
+    for 32 measured decisions clears the verdicts it contradicts (those at
+    its row count or fewer).
     """
 
     def __init__(self):
-        self._cooldowns = {}
+        self.clock = 0
+        # rows -> (clock value the park ends at, cooldown of the next park)
+        self._verdicts = {}
+
+    def tick(self):
+        """Count one batched decode step (ordinary or MTP) of this model."""
+        self.clock += 1
 
     def seed(self, policy):
+        if policy.fixed:
+            return
         rows = len(policy.uids)
-        known = [c for k, c in self._cooldowns.items() if k <= rows]
-        if known and not policy.fixed:
-            policy.start_parked(max(known))
+        live = [
+            verdict
+            for k, verdict in self._verdicts.items()
+            if k <= rows and verdict[0] > self.clock
+        ]
+        if live:
+            policy.start_parked(
+                max(until for until, _ in live) - self.clock,
+                next_cooldown=max(cooldown for _, cooldown in live),
+            )
 
     def parked(self, policy):
-        self._cooldowns[len(policy.uids)] = policy.cooldown
+        self._verdicts[len(policy.uids)] = (
+            self.clock + policy.remaining,
+            policy.cooldown,
+        )
 
     def retired(self, policy):
         if policy.held_up():
             rows = len(policy.uids)
-            for k in [k for k in self._cooldowns if k <= rows]:
-                del self._cooldowns[k]
+            for k in [k for k in self._verdicts if k <= rows]:
+                del self._verdicts[k]

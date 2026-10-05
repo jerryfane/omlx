@@ -5689,18 +5689,21 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
 
 
 def test_batch_park_verdict_outlives_its_cohort():
-    """MTP parked at k rows keeps new cohorts of k or more rows parked (with
-    the doubled cooldown) until a cohort where MTP holds up clears it."""
+    """MTP parked at k rows keeps new cohorts of k or more rows parked for what
+    is left of the park, until a cohort where MTP holds up clears it."""
     from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
 
     memory = ParkMemory()
     lost = BatchPolicy(range(4), 3)
     lost.park()
     memory.parked(lost)
+    for _ in range(28):
+        memory.tick()
     wider, narrower = BatchPolicy(range(8), 3), BatchPolicy(range(2), 3)
     memory.seed(wider)
     memory.seed(narrower)
-    assert wider.remaining == 256 and wider.cooldown == 512
+    # 128 - 28 steps of the park are left; the next park doubles once.
+    assert wider.remaining == 100 and wider.cooldown == 256
     assert narrower.remaining == 0
     fixed = BatchPolicy(range(8), 3, fixed=True)
     memory.seed(fixed)
@@ -5711,10 +5714,45 @@ def test_batch_park_verdict_outlives_its_cohort():
     memory.retired(short)
     again = BatchPolicy(range(4), 3)
     memory.seed(again)
-    assert again.remaining == 256
+    assert again.remaining == 100
     held = BatchPolicy(range(8), 3)
     held.decisions = 32
     memory.retired(held)
     fresh = BatchPolicy(range(8), 3)
     memory.seed(fresh)
     assert fresh.remaining == 0
+
+
+def test_batch_park_expires_while_cohorts_come_and_go():
+    """A park ends on the model's step clock, not per cohort: with a cohort
+    change every 50-150 steps and MTP winning once measured again, new
+    cohorts measure MTP after the park and keep running it."""
+    import random
+
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    lost = BatchPolicy(range(8), 3)
+    lost.park()
+    memory.parked(lost)
+    rng = random.Random(0)
+    steps = mtp_cycles = 0
+    first_mtp = None
+    while steps < 6000:
+        policy = BatchPolicy(range(8), 3)
+        memory.seed(policy)
+        for _ in range(rng.randint(50, 150)):
+            memory.tick()
+            steps += 1
+            if policy.needs_standard():
+                policy.observe_standard(10.0)
+                continue
+            # Every draft accepted at 6 ms a cycle: MTP clearly wins.
+            policy.observe_mtp(policy.cur, [policy.cur] * 8, 6.0, stable=True)
+            mtp_cycles += 1
+            first_mtp = steps if first_mtp is None else first_mtp
+            assert not policy.should_park()
+        memory.retired(policy)
+    # The 128-step park, then one cohort's calibration (2 warmup + 3 samples).
+    assert first_mtp is not None and first_mtp <= 128 + 150 + 5
+    assert mtp_cycles > 0.9 * (6000 - first_mtp) - 5 * 6000 / 50

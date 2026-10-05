@@ -130,6 +130,7 @@ def apply() -> bool:
         def patched_next(self, *args, **kwargs):
             if _is_mtp_batch_eligible(self):
                 policy = _batch_policy_for_next(self)
+                _batch_park_memory(self.model).tick()
                 if policy is not None and policy.needs_standard():
                     if not _reconcile_mtp_batch_to_standard(self):
                         raise RuntimeError(
