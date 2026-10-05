@@ -1029,7 +1029,6 @@ def _qwen4_prefill(module, inputs, cache):
     )
     if hasattr(cache, "advance"):
         cache.advance(length)
-        q35._qwen3_5_advance_left_padding_info(cache, length)
         q35._qwen3_5_advance_lengths_info(cache, length)
     flat = norm_gate(
         inputs=[
@@ -1870,7 +1869,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         cache[0], cache[1] = conv_state, state
         if hasattr(cache, "advance"):
             cache.advance(1)
-            q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
         global _QWEN4_DECODE_ENGAGED_LOGGED
         if not _QWEN4_DECODE_ENGAGED_LOGGED:
@@ -1933,7 +1931,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             result = self.out_proj(out.reshape(1, 1, -1))
             cache[0], cache[1] = conv_state, state
             cache.advance(1)
-            q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
             global _QWEN35_DECODE_ENGAGED_LOGGED
             if not _QWEN35_DECODE_ENGAGED_LOGGED:
@@ -1973,7 +1970,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         cache[0], cache[1] = conv_state, state
         if hasattr(cache, "advance"):
             cache.advance(1)
-            q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
         global _QWEN4_DECODE_ENGAGED_LOGGED
         if not _QWEN4_DECODE_ENGAGED_LOGGED:
@@ -2020,7 +2016,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 result = _qwen4_verify(plan, inputs, cache)
                 if hasattr(cache, "advance"):
                     cache.advance(length)
-                    q35._qwen3_5_advance_left_padding_info(cache, length)
                     q35._qwen3_5_advance_lengths_info(cache, length)
                 global _QWEN4_VERIFY_ENGAGED_LOGGED
                 if not _QWEN4_VERIFY_ENGAGED_LOGGED:
@@ -2135,7 +2130,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             )
         if hasattr(cache, "advance"):
             cache.advance(length)
-            q35._qwen3_5_advance_left_padding_info(cache, length)
             q35._qwen3_5_advance_lengths_info(cache, length)
         if not fused:
             out = layer.norm(
