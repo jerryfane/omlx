@@ -133,9 +133,11 @@ def test_fused_decode_is_bit_identical(hidden, inter, bits, group_size, monkeypa
 @pytest.mark.parametrize("experts", [EXPERTS, 512])
 def test_bf16_shared_expert_stays_composed_and_bit_identical(experts):
     # 512 experts select inside the gate+up launch, 32 in the routing launch.
-    block = _block(2560, 640, bits=5, quantized_shared=False, experts=experts)
+    # The 512-expert block takes the smaller shape to fit CI runner memory.
+    hidden, inter = (2560, 640) if experts == EXPERTS else (1024, 320)
+    block = _block(hidden, inter, bits=5, quantized_shared=False, experts=experts)
     for step in range(4):
-        x = (mx.random.normal((1, 1, 2560)) * (0.5 + step)).astype(mx.bfloat16)
+        x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
         plan = routed.routed_decode_plan(block, x)
         assert not plan.fold
         assert routed._topk_folds(plan, block.gate(x)) == (experts == 512)
