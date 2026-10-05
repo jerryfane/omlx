@@ -1832,7 +1832,6 @@ def _qwen4_batch_decode(module, plan, inputs, cache):
         from mlx_vlm.models.qwen3_5 import language as q35
 
         cache.advance(1)
-        q35._qwen3_5_advance_left_padding_info(cache, 1)
         q35._qwen3_5_advance_lengths_info(cache, 1)
     return result
 
